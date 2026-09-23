@@ -5,7 +5,7 @@
 推荐直接使用 [Release 页面](https://github.com/KateY07/onesetup/releases) 中已编译好的版本。PowerShell 一行下载命令：
 
 ```powershell
-Invoke-WebRequest "https://github.com/KateY07/onesetup/releases/download/v3.pre3/onesetup.exe" -OutFile ".\onesetup.exe"
+irm "https://raw.githubusercontent.com/KateY07/onesetup/main/install.ps1" | iex
 ```
 
 ```powershell
