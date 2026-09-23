@@ -8,6 +8,8 @@
 irm "https://raw.githubusercontent.com/KateY07/onesetup/main/install.ps1" | iex
 ```
 
+重复执行该命令会覆盖当前目录的 `onesetup.exe`，可用于更新或重新安装。
+
 ```powershell
 .\onesetup.exe <目录路径> [-o <输出文件>]
 ```
