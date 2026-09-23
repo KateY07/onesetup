@@ -60,18 +60,20 @@ static class Program
         if (File.Exists(outputPath))
             throw new IOException($"Output file already exists: {outputPath}");
 
-        ToolPaths tools = Find7ZipTools(currentExecutable);
+        string sevenZipPath = Find7ZipPath(currentExecutable);
         string temporaryDirectory = Path.Combine(Path.GetTempPath(), $"onesetup-pack-{Guid.NewGuid():N}");
         Directory.CreateDirectory(temporaryDirectory);
         string archivePath = Path.Combine(temporaryDirectory, "payload.7z");
         string configPath = Path.Combine(temporaryDirectory, "config.txt");
+        string sfxModulePath = Path.Combine(temporaryDirectory, "7zSD.sfx");
         string temporaryOutput = Path.Combine(temporaryDirectory, "package.exe");
 
         try
         {
-            await Create7zArchiveAsync(tools.SevenZipPath, sourceDirectory, archivePath);
+            await Create7zArchiveAsync(sevenZipPath, sourceDirectory, archivePath);
             await WriteSfxConfigAsync(configPath, File.Exists(Path.Combine(sourceDirectory, "install.bat")));
-            await ConcatenateAsync(temporaryOutput, tools.SfxModulePath, configPath, archivePath);
+            await WriteEmbeddedSfxAsync(sfxModulePath);
+            await ConcatenateAsync(temporaryOutput, sfxModulePath, configPath, archivePath);
 
             string? outputDirectory = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(outputDirectory))
@@ -124,9 +126,17 @@ static class Program
         config.AppendLine("OverwriteMode=\"1\"");
         config.AppendLine("TempMode=\"yes\"");
         if (hasInstallScript)
-            config.AppendLine("RunProgram=\"cmd.exe /d /c call \\\"%%T\\\\install.bat\\\"\"");
+            config.AppendLine("RunProgram=\"cmd.exe /d /c cd /d \\\"%%T\\\" && call \\\"%%T\\\\install.bat\\\"\"");
         config.AppendLine(";!@InstallEnd@!");
         await File.WriteAllTextAsync(configPath, config.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+    }
+
+    static async Task WriteEmbeddedSfxAsync(string outputPath)
+    {
+        await using Stream resource = typeof(Program).Assembly.GetManifestResourceStream("OneSetup.7zSD.sfx")
+            ?? throw new InvalidOperationException("The embedded 7z SFX module is missing.");
+        await using FileStream output = new(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        await resource.CopyToAsync(output);
     }
 
     static async Task ConcatenateAsync(string outputPath, params string[] inputPaths)
@@ -145,7 +155,7 @@ static class Program
             await writer.WriteLineAsync(line);
     }
 
-    static ToolPaths Find7ZipTools(string currentExecutable)
+    static string Find7ZipPath(string currentExecutable)
     {
         string currentDirectory = Path.GetDirectoryName(currentExecutable) ?? Environment.CurrentDirectory;
         string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
@@ -161,13 +171,10 @@ static class Program
         string? sevenZipPath = distinctRoots
             .Select(root => Path.Combine(root, "7z.exe"))
             .FirstOrDefault(File.Exists);
-        string? sfxPath = distinctRoots
-            .SelectMany(root => new[] { Path.Combine(root, "sfx", "7zSD.sfx"), Path.Combine(root, "7zSD.sfx") })
-            .FirstOrDefault(File.Exists);
-        if (sevenZipPath is not null && sfxPath is not null)
-            return new ToolPaths(sevenZipPath, sfxPath);
+        if (sevenZipPath is not null)
+            return sevenZipPath;
 
-        throw new FileNotFoundException("7z.exe and 7zSD.sfx were not found. Install 7-Zip or place 7z.exe beside onesetup.exe.");
+        throw new FileNotFoundException("7z.exe was not found. Install 7-Zip or place 7z.exe beside onesetup.exe.");
     }
 
     static bool IsInsideDirectory(string path, string directory)
@@ -203,8 +210,6 @@ static class Program
         Console.WriteLine("  onesetup.exe <path-to-dir> [-o <output.exe>]");
         Console.WriteLine();
         Console.WriteLine("The default output is <directory-name>_setup.exe in the current directory.");
-        Console.WriteLine("The packer requires 7z.exe; the 7zSD.sfx installer module is included with the build.");
+        Console.WriteLine("The packer requires 7z.exe; the 7zSD.sfx installer module is embedded in onesetup.exe.");
     }
-
-    readonly record struct ToolPaths(string SevenZipPath, string SfxModulePath);
 }
