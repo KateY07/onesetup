@@ -60,9 +60,10 @@ static class Program
         if (File.Exists(outputPath))
             throw new IOException($"Output file already exists: {outputPath}");
 
-        string sevenZipPath = Find7ZipPath(currentExecutable);
         string temporaryDirectory = Path.Combine(Path.GetTempPath(), $"onesetup-pack-{Guid.NewGuid():N}");
         Directory.CreateDirectory(temporaryDirectory);
+        string sevenZipPath = Path.Combine(temporaryDirectory, "7z.exe");
+        string sevenZipLibraryPath = Path.Combine(temporaryDirectory, "7z.dll");
         string archivePath = Path.Combine(temporaryDirectory, "payload.7z");
         string configPath = Path.Combine(temporaryDirectory, "config.txt");
         string sfxModulePath = Path.Combine(temporaryDirectory, "7zSD.sfx");
@@ -70,9 +71,11 @@ static class Program
 
         try
         {
+            await WriteEmbeddedResourceAsync("OneSetup.7z.exe", sevenZipPath);
+            await WriteEmbeddedResourceAsync("OneSetup.7z.dll", sevenZipLibraryPath);
             await Create7zArchiveAsync(sevenZipPath, sourceDirectory, archivePath);
             await WriteSfxConfigAsync(configPath, File.Exists(Path.Combine(sourceDirectory, "install.bat")));
-            await WriteEmbeddedSfxAsync(sfxModulePath);
+            await WriteEmbeddedResourceAsync("OneSetup.7zSD.sfx", sfxModulePath);
             await ConcatenateAsync(temporaryOutput, sfxModulePath, configPath, archivePath);
 
             string? outputDirectory = Path.GetDirectoryName(outputPath);
@@ -131,10 +134,10 @@ static class Program
         await File.WriteAllTextAsync(configPath, config.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
     }
 
-    static async Task WriteEmbeddedSfxAsync(string outputPath)
+    static async Task WriteEmbeddedResourceAsync(string resourceName, string outputPath)
     {
-        await using Stream resource = typeof(Program).Assembly.GetManifestResourceStream("OneSetup.7zSD.sfx")
-            ?? throw new InvalidOperationException("The embedded 7z SFX module is missing.");
+        await using Stream resource = typeof(Program).Assembly.GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException($"The embedded resource is missing: {resourceName}");
         await using FileStream output = new(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         await resource.CopyToAsync(output);
     }
@@ -153,28 +156,6 @@ static class Program
     {
         while (await reader.ReadLineAsync() is { } line)
             await writer.WriteLineAsync(line);
-    }
-
-    static string Find7ZipPath(string currentExecutable)
-    {
-        string currentDirectory = Path.GetDirectoryName(currentExecutable) ?? Environment.CurrentDirectory;
-        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-        string programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
-        string[] roots =
-        [
-            currentDirectory,
-            Path.Combine(programFiles, "7-Zip"),
-            Path.Combine(programFilesX86, "7-Zip")
-        ];
-
-        string[] distinctRoots = roots.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        string? sevenZipPath = distinctRoots
-            .Select(root => Path.Combine(root, "7z.exe"))
-            .FirstOrDefault(File.Exists);
-        if (sevenZipPath is not null)
-            return sevenZipPath;
-
-        throw new FileNotFoundException("7z.exe was not found. Install 7-Zip or place 7z.exe beside onesetup.exe.");
     }
 
     static bool IsInsideDirectory(string path, string directory)
@@ -210,6 +191,6 @@ static class Program
         Console.WriteLine("  onesetup.exe <path-to-dir> [-o <output.exe>]");
         Console.WriteLine();
         Console.WriteLine("The default output is <directory-name>_setup.exe in the current directory.");
-        Console.WriteLine("The packer requires 7z.exe; the 7zSD.sfx installer module is embedded in onesetup.exe.");
+        Console.WriteLine("The 7z packer and 7zSD.sfx installer module are embedded in onesetup.exe.");
     }
 }

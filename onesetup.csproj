@@ -9,7 +9,9 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
   <ItemGroup>
-    <None Remove="sfx\7zSD.sfx" />
+    <None Remove="sfx\7zSD.sfx;vendor\7z.exe;vendor\7z.dll" />
     <EmbeddedResource Include="sfx\7zSD.sfx" LogicalName="OneSetup.7zSD.sfx" />
+    <EmbeddedResource Include="vendor\7z.exe" LogicalName="OneSetup.7z.exe" />
+    <EmbeddedResource Include="vendor\7z.dll" LogicalName="OneSetup.7z.dll" />
   </ItemGroup>
 </Project>
