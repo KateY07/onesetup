@@ -2,6 +2,12 @@
 
 把一个目录打包成单文件安装器。运行生成的 `.exe` 时，会自动解压到临时目录，并执行目录中的 `install.bat`（如果存在）。
 
+推荐直接使用 [Release 页面](https://github.com/KateY07/onesetup/releases) 中已编译好的版本。PowerShell 一行下载命令：
+
+```powershell
+Invoke-WebRequest "https://github.com/KateY07/onesetup/releases/download/v3.pre3/onesetup.exe" -OutFile ".\onesetup.exe"
+```
+
 ```powershell
 .\onesetup.exe <目录路径> [-o <输出文件>]
 ```
