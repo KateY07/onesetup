@@ -129,7 +129,10 @@ static class Program
         config.AppendLine("OverwriteMode=\"1\"");
         config.AppendLine("TempMode=\"yes\"");
         if (hasInstallScript)
-            config.AppendLine("RunProgram=\"cmd.exe /d /c cd /d \\\"%%T\\\" && call \\\"%%T\\\\install.bat\\\"\"");
+        {
+            config.AppendLine("ExecuteFile=\"cmd.exe\"");
+            config.AppendLine("ExecuteParameters=\"/d /v:on /c \\\"call install.bat & set exitCode=!errorlevel! & if not !exitCode!==0 (echo OneSetup: install.bat failed with exit code !exitCode! & pause) & exit /b !exitCode!\\\"\"");
+        }
         config.AppendLine(";!@InstallEnd@!");
         await File.WriteAllTextAsync(configPath, config.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
     }
