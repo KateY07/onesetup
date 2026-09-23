@@ -1,1 +1,9 @@
-`.\onesetup.exe path-to-dir`
+# OneSetup
+
+把一个目录打包成单文件安装器。运行生成的 `.exe` 时，会自动解压到临时目录，并执行目录中的 `install.bat`（如果存在）。
+
+```powershell
+.\onesetup.exe <目录路径> [-o <输出文件>]
+```
+
+不指定 `-o` 时，输出文件默认为 `<目录名>_setup.exe`。生成的文件是 7z 自解压格式，可直接运行，也可使用 7-Zip 查看或解压；目标电脑无需安装 7-Zip。
