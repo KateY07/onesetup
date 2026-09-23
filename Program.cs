@@ -131,7 +131,7 @@ static class Program
         if (hasInstallScript)
         {
             config.AppendLine("ExecuteFile=\"cmd.exe\"");
-            config.AppendLine("ExecuteParameters=\"/d /v:on /c \\\"call install.bat & set exitCode=!errorlevel! & if not !exitCode!==0 (echo OneSetup: install.bat failed with exit code !exitCode! & pause) & exit /b !exitCode!\\\"\"");
+            config.AppendLine("ExecuteParameters=\"/d /c \\\"call install.bat & if errorlevel 1 (echo OneSetup: install.bat failed with a nonzero exit code & pause & exit /b 1)\\\"\"");
         }
         config.AppendLine(";!@InstallEnd@!");
         await File.WriteAllTextAsync(configPath, config.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));

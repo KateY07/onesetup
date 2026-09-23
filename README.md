@@ -15,3 +15,9 @@ irm "https://raw.githubusercontent.com/KateY07/onesetup/main/install.ps1" | iex
 ```
 
 不指定 `-o` 时，输出文件默认为 `<目录名>_setup.exe`。`onesetup.exe` 需要 .NET 10 Runtime，7z 打包组件和 SFX 解压模块已内置；生成的安装器运行时不依赖外部 .NET 或 7-Zip。`install.bat` 自身调用的程序依赖仍需由安装目标机提供。
+
+运行自动化集成测试：
+
+```powershell
+dotnet run --project .\tests\OneSetup.IntegrationTests -- .\publish\onesetup.exe
+```
