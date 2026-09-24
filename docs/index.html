@@ -15,11 +15,9 @@
     pre { overflow-x: auto; padding: 16px; border-radius: 8px; background: #1f2328; color: #f0f6fc; }
     code { font-family: Consolas, "SFMono-Regular", monospace; }
     .download { display: inline-block; margin: 12px 0; padding: 10px 16px; border-radius: 7px; background: #0969da; color: white; text-decoration: none; }
-    .note { padding: 12px 16px; border-left: 4px solid #0969da; background: #eaf2ff; }
     @media (prefers-color-scheme: dark) {
       body { background: #0d1117; color: #e6edf3; }
       a { color: #58a6ff; }
-      .note { background: #172b4d; }
     }
   </style>
 </head>
@@ -33,8 +31,6 @@
     <h2>使用</h2>
     <pre><code>.onesetup.exe &lt;目录路径&gt; [-o &lt;输出文件&gt;]</code></pre>
     <p>不指定 <code>-o</code> 时，输出文件默认为 <code>&lt;目录名&gt;_setup.exe</code>。</p>
-
-    <p class="note"><code>onesetup.exe</code> 需要 .NET 10 Runtime。7z 打包组件和 SFX 解压模块已内置；生成的安装器运行时不依赖外部 .NET 或 7-Zip。<code>install.bat</code> 自身调用的程序依赖仍需由目标机器提供。</p>
 
   </main>
 </body>
