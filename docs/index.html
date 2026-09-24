@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OneSetup</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #f6f7f9; color: #202124; }
+    main { max-width: 760px; margin: 0 auto; padding: 64px 24px; }
+    h1 { margin-bottom: 8px; font-size: 42px; }
+    h2 { margin-top: 36px; }
+    p { line-height: 1.7; }
+    a { color: #0969da; }
+    pre { overflow-x: auto; padding: 16px; border-radius: 8px; background: #1f2328; color: #f0f6fc; }
+    code { font-family: Consolas, "SFMono-Regular", monospace; }
+    .download { display: inline-block; margin: 12px 0; padding: 10px 16px; border-radius: 7px; background: #0969da; color: white; text-decoration: none; }
+    .note { padding: 12px 16px; border-left: 4px solid #0969da; background: #eaf2ff; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0d1117; color: #e6edf3; }
+      a { color: #58a6ff; }
+      .note { background: #172b4d; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>OneSetup</h1>
+    <p>把一个目录打包成单文件安装器。运行生成的 <code>.exe</code> 时，它会自动解压到临时目录，并执行根目录中的 <code>install.bat</code>（如果存在）。</p>
+
+    <a class="download" href="https://github.com/KateY07/onesetup/releases/latest/download/onesetup.exe">下载 onesetup.exe</a>
+    <p><a href="https://github.com/KateY07/onesetup/releases">查看所有 Release</a></p>
+
+    <h2>安装或更新 OneSetup</h2>
+    <p>在 PowerShell 中执行以下命令。重复执行会覆盖当前目录的 <code>onesetup.exe</code>：</p>
+    <pre><code>irm "https://raw.githubusercontent.com/KateY07/onesetup/main/install.ps1" | iex</code></pre>
+
+    <h2>使用</h2>
+    <pre><code>.onesetup.exe &lt;目录路径&gt; [-o &lt;输出文件&gt;]</code></pre>
+    <p>不指定 <code>-o</code> 时，输出文件默认为 <code>&lt;目录名&gt;_setup.exe</code>。</p>
+
+    <p class="note"><code>onesetup.exe</code> 需要 .NET 10 Runtime。7z 打包组件和 SFX 解压模块已内置；生成的安装器运行时不依赖外部 .NET 或 7-Zip。<code>install.bat</code> 自身调用的程序依赖仍需由目标机器提供。</p>
+
+    <h2>项目</h2>
+    <p><a href="https://github.com/KateY07/onesetup">在 GitHub 查看源代码</a></p>
+  </main>
+</body>
+</html>
