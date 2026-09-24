@@ -46,7 +46,7 @@ static class Program
                 if (Environment.GetEnvironmentVariable("ONESETUP_KEEP_TEST_ROOT") == "1")
                     Console.Error.WriteLine($"Preserved test directory: {testRoot}");
                 else if (Directory.Exists(testRoot))
-                    Directory.Delete(testRoot, recursive: true);
+                    await DeleteTestDirectoryAsync(testRoot);
             }
             catch (Exception cleanupException)
             {
@@ -120,9 +120,7 @@ static class Program
     static void AssertSfxConfiguration(string setupPath)
     {
         string packageText = Encoding.UTF8.GetString(File.ReadAllBytes(setupPath));
-        Ensure(packageText.Contains("ExecuteFile=\"cmd.exe\"", StringComparison.Ordinal), "The generated SFX does not use ExecuteFile for cmd.exe.");
-        Ensure(packageText.Contains("ExecuteParameters=", StringComparison.Ordinal), "The generated SFX has no ExecuteParameters entry.");
-        Ensure(packageText.Contains("install.bat failed with a nonzero exit code", StringComparison.Ordinal), "The generated SFX does not expose install.bat failures.");
+        Ensure(packageText.Contains("ExecuteFile=\"install.bat\"", StringComparison.Ordinal), "The generated SFX does not execute install.bat directly.");
         Ensure(!packageText.Contains("RunProgram=\"cmd.exe", StringComparison.Ordinal), "The generated SFX still uses the broken RunProgram cmd.exe path.");
     }
 
@@ -256,6 +254,28 @@ static class Program
     }
 
     static void WriteText(string path, string content) => File.WriteAllText(path, content, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+    static async Task DeleteTestDirectoryAsync(string path)
+    {
+        for (int attempt = 0; attempt < 20; attempt++)
+        {
+            try
+            {
+                Directory.Delete(path, recursive: true);
+                return;
+            }
+            catch (IOException) when (attempt < 19)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(250));
+            }
+            catch (UnauthorizedAccessException) when (attempt < 19)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(250));
+            }
+        }
+
+        Directory.Delete(path, recursive: true);
+    }
 
     static void Ensure(bool condition, string message)
     {
