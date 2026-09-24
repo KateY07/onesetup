@@ -60,12 +60,27 @@ static class Program
         string sourceDirectory = Path.Combine(testRoot, "source");
         string runnerDirectory = Path.Combine(testRoot, "runner");
         string setupPath = Path.Combine(runnerDirectory, "fixture_setup.exe");
-        string batchMarkerPath = Path.Combine(testRoot, "install-bat.marker");
+        string directReportPath = Path.Combine(testRoot, "direct-bat-report.txt");
+        string sfxReportPath = Path.Combine(testRoot, "sfx-bat-report.txt");
         string extractedDirectory = Path.Combine(testRoot, "extracted-by-7z");
         Directory.CreateDirectory(runnerDirectory);
         Directory.CreateDirectory(extractedDirectory);
         CreateFixture(sourceDirectory);
         Manifest expectedManifest = CaptureManifest(sourceDirectory);
+
+        ProcessResult directResult = await RunProcessAsync(
+            "cmd.exe",
+            ["/d", "/c", "call", Path.Combine(sourceDirectory, "install.bat")],
+            sourceDirectory,
+            new Dictionary<string, string?>
+            {
+                ["ONESETUP_TEST_BAT_RESULT"] = directReportPath
+            },
+            TestTimeout);
+        Ensure(directResult.ExitCode == 0, $"Direct install.bat execution failed with exit code {directResult.ExitCode}.\nSTDOUT:\n{directResult.StandardOutput}\nSTDERR:\n{directResult.StandardError}");
+        BatchReport directReport = ReadBatchReport(directReportPath);
+        Ensure(PathsEqual(directReport.CurrentDirectory, sourceDirectory), $"Direct install.bat current directory was incorrect: {directReport.CurrentDirectory}");
+        Ensure(PathsEqual(directReport.ScriptDirectory, sourceDirectory), $"Direct install.bat script directory was incorrect: {directReport.ScriptDirectory}");
 
         ProcessResult packResult = await RunProcessAsync(
             packerPath,
@@ -98,12 +113,15 @@ static class Program
             runnerDirectory,
             new Dictionary<string, string?>
             {
-                ["ONESETUP_TEST_BAT_RESULT"] = batchMarkerPath
+                ["ONESETUP_TEST_BAT_RESULT"] = sfxReportPath
             },
             TestTimeout);
         Ensure(sfxResult.ExitCode == 0, $"SFX execution failed with exit code {sfxResult.ExitCode}.\nSTDOUT:\n{sfxResult.StandardOutput}\nSTDERR:\n{sfxResult.StandardError}");
-        Ensure(File.Exists(batchMarkerPath), "install.bat was not executed.");
-        AssertBatchEnvironment(batchMarkerPath);
+        Ensure(File.Exists(sfxReportPath), "install.bat was not executed by the SFX.");
+        BatchReport sfxReport = ReadBatchReport(sfxReportPath);
+        Ensure(PathsEqual(sfxReport.CurrentDirectory, sfxReport.ScriptDirectory), $"SFX install.bat current directory did not match its script directory. Current='{sfxReport.CurrentDirectory}', ScriptRoot='{sfxReport.ScriptDirectory}'.");
+        Ensure(IsUnderDirectory(sfxReport.CurrentDirectory, Path.GetTempPath()), $"SFX install.bat did not run from a temporary extraction directory: {sfxReport.CurrentDirectory}");
+        AssertEnvironmentEqual(directReport.Environment, sfxReport.Environment);
         AssertManifestEqual(expectedManifest, CaptureManifest(sourceDirectory));
     }
 
@@ -114,7 +132,7 @@ static class Program
         WriteText(Path.Combine(sourceDirectory, "payload.txt"), "payload\r\n");
         WriteText(Path.Combine(sourceDirectory, "nested", "config.json"), "{\"enabled\":true}\r\n");
         WriteText(Path.Combine(sourceDirectory, "unicode-测试.txt"), "unicode payload\r\n");
-        WriteText(Path.Combine(sourceDirectory, "install.bat"), "@echo off\r\nsetlocal\r\n> \"%ONESETUP_TEST_BAT_RESULT%\" echo install-bat-ran\r\n>> \"%ONESETUP_TEST_BAT_RESULT%\" echo current-directory=%CD%\r\n>> \"%ONESETUP_TEST_BAT_RESULT%\" echo script-directory=%~dp0\r\nendlocal\r\nexit /b 0\r\n");
+        WriteText(Path.Combine(sourceDirectory, "install.bat"), "@echo off\r\nsetlocal\r\n> \"%ONESETUP_TEST_BAT_RESULT%\" echo install-bat-ran\r\n>> \"%ONESETUP_TEST_BAT_RESULT%\" echo current-directory=%CD%\r\n>> \"%ONESETUP_TEST_BAT_RESULT%\" echo script-directory=%~dp0\r\n>> \"%ONESETUP_TEST_BAT_RESULT%\" echo environment-start\r\n>> \"%ONESETUP_TEST_BAT_RESULT%\" set\r\nendlocal\r\nexit /b 0\r\n");
     }
 
     static void AssertSfxConfiguration(string setupPath)
@@ -124,16 +142,35 @@ static class Program
         Ensure(!packageText.Contains("RunProgram=\"cmd.exe", StringComparison.Ordinal), "The generated SFX still uses the broken RunProgram cmd.exe path.");
     }
 
-    static void AssertBatchEnvironment(string reportPath)
+    static BatchReport ReadBatchReport(string reportPath)
     {
         string[] lines = File.ReadAllLines(reportPath);
         Ensure(lines.Length >= 3, "install.bat did not write its complete environment report.");
         Ensure(lines[0].Trim() == "install-bat-ran", "install.bat marker content is incorrect.");
         string currentDirectory = ValueAfter(lines, "current-directory=");
         string scriptDirectory = ValueAfter(lines, "script-directory=").TrimEnd('\\', '/');
-        Ensure(PathsEqual(currentDirectory, scriptDirectory), $"The working directory was not the extracted root. Current='{currentDirectory}', ScriptRoot='{scriptDirectory}'.");
-        Ensure(IsUnderDirectory(currentDirectory, Path.GetTempPath()), $"The batch file did not run from a temporary extraction directory: {currentDirectory}");
+        int environmentStart = Array.IndexOf(lines, "environment-start");
+        Ensure(environmentStart >= 0, "install.bat did not write its environment report.");
+        Dictionary<string, string> environment = lines
+            .Skip(environmentStart + 1)
+            .Where(line => line.Contains('='))
+            .Select(line => line.Split('=', 2))
+            .ToDictionary(parts => parts[0], parts => NormalizeEnvironmentValue(parts[0], parts[1]), StringComparer.OrdinalIgnoreCase);
+        return new BatchReport(currentDirectory, scriptDirectory, environment);
     }
+
+    static void AssertEnvironmentEqual(Dictionary<string, string> expected, Dictionary<string, string> actual)
+    {
+        foreach ((string name, string value) in expected)
+        {
+            Ensure(actual.TryGetValue(name, out string? actualValue), $"Environment variable was missing: {name}");
+            Ensure(string.Equals(value, actualValue, StringComparison.Ordinal), $"Environment variable changed: {name}");
+        }
+        foreach (string name in actual.Keys)
+            Ensure(expected.ContainsKey(name), $"Unexpected environment variable: {name}");
+    }
+
+    static string NormalizeEnvironmentValue(string name, string value) => name.Equals("CMDCMDLINE", StringComparison.OrdinalIgnoreCase) || name.Equals("ONESETUP_TEST_BAT_RESULT", StringComparison.OrdinalIgnoreCase) ? "<normalized>" : value;
 
     static string ValueAfter(IEnumerable<string> lines, string prefix)
     {
@@ -288,4 +325,5 @@ static class Program
     readonly record struct ProcessResult(int ExitCode, string StandardOutput, string StandardError);
     readonly record struct FileEntry(string Path, string Hash, long Length);
     readonly record struct Manifest(List<FileEntry> Files, List<string> Directories);
+    readonly record struct BatchReport(string CurrentDirectory, string ScriptDirectory, Dictionary<string, string> Environment);
 }
