@@ -109,6 +109,7 @@ static class Program
 
         await AssertLevelAndProgressAsync(packerPath, sevenZipPath, testRoot, runnerDirectory);
         await AssertUiPackagingAsync(packerPath, sevenZipPath, sourceDirectory, runnerDirectory);
+        await AssertFailureExitCodeAsync(packerPath, runnerDirectory, testRoot);
 
         ProcessResult sfxResult = await RunProcessAsync(
             setupPath,
@@ -228,6 +229,21 @@ static class Program
         }
         for (int index = 0; index < expected.Directories.Count; index++)
             Ensure(string.Equals(expected.Directories[index], actual.Directories[index], StringComparison.OrdinalIgnoreCase), $"Directory structure changed: expected '{expected.Directories[index]}', actual '{actual.Directories[index]}'.");
+    }
+
+    // Documents a limitation: the 7zSD module returns 0 even when install.bat fails, so callers must not rely on it.
+    static async Task AssertFailureExitCodeAsync(string packerPath, string runnerDirectory, string testRoot)
+    {
+        string failing = Path.Combine(testRoot, "failing");
+        Directory.CreateDirectory(failing);
+        string marker = Path.Combine(testRoot, "failing-ran.txt");
+        await File.WriteAllTextAsync(Path.Combine(failing, "install.bat"), "@echo off" + Environment.NewLine + "echo ran> \"%ONESETUP_TEST_MARKER%\"" + Environment.NewLine + "exit /b 3" + Environment.NewLine);
+        string setup = Path.Combine(runnerDirectory, "failing_setup.exe");
+        ProcessResult pack = await RunProcessAsync(packerPath, [failing, "-o", setup, "-l", "1"], runnerDirectory, timeout: TestTimeout);
+        Ensure(pack.ExitCode == 0, $"Packing failed. {pack.StandardError}");
+        ProcessResult run = await RunProcessAsync(setup, ["-y"], runnerDirectory, new Dictionary<string, string?> { ["ONESETUP_TEST_MARKER"] = marker }, TestTimeout);
+        Ensure(File.Exists(marker), "The failing install.bat did not run.");
+        Ensure(run.ExitCode == 0, $"7zSD now propagates install.bat's exit code ({run.ExitCode}); update the docs and this test.");
     }
 
     static async Task AssertUiPackagingAsync(string packerPath, string sevenZipPath, string sourceDirectory, string runnerDirectory)

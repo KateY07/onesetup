@@ -1017,6 +1017,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     if (headless)
     {
         AttachConsole(ATTACH_PARENT_PROCESS);
+        SetEnvironmentVariableW(L"ONESETUP_SHELL", L"headless");
         const wchar_t* names[] = { L"debug", L"info", L"warn", L"error", L"ask", L"progress", L"title" };
         return RunScript(script, extra,
             [&](Kind k, const std::wstring& t, bool err) { Console(L"[" + std::wstring(err ? L"stderr" : names[(int)k]) + L"] " + t); },
@@ -1029,6 +1030,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
             });
     }
 
+    SetEnvironmentVariableW(L"ONESETUP_SHELL", L"ui");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     WNDCLASSEXW wc{ sizeof wc };
     wc.lpfnWndProc = WndProc;

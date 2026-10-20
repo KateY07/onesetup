@@ -292,16 +292,42 @@ static class Program
 
     static void PrintUsage()
     {
-        Console.WriteLine("onesetup - 7-Zip self-extracting archive packer");
-        Console.WriteLine();
-        Console.WriteLine("Pack a directory:");
-        Console.WriteLine("  onesetup.exe <path-to-dir> [-o <output.exe>] [-l <0-9>] [--ui]");
-        Console.WriteLine();
-        Console.WriteLine("  -o, --output  output file (default: <directory-name>_setup.exe)");
-        Console.WriteLine("  --ui          run install.bat through the built-in UI shell (steps, progress, questions); see ui/README.md");
-        Console.WriteLine("  -l, --level   compression level: 0 = store, 1 = fastest, 9 = smallest (default: 9)");
-        Console.WriteLine();
-        Console.WriteLine("The default output is <directory-name>_setup.exe in the current directory.");
-        Console.WriteLine("The 7z packer and 7zSD.sfx installer module are embedded in onesetup.exe.");
+        Console.WriteLine("""
+            onesetup - pack a directory into a single-file Windows installer
+
+            USAGE
+              onesetup <dir> [-o <output.exe>] [-l <0-9>] [--ui | --ui-exe <file>]
+              onesetup -h | --help
+
+            OPTIONS
+              -o, --output <file>  output file (default: <dir-name>_setup.exe in the current directory; never overwrites)
+              -l, --level <0-9>    compression: 0 store, 1 fastest, 9 smallest (default: 9)
+              --ui                 run install.bat through the built-in UI shell (requires install.bat in <dir>)
+              --ui-exe <file>      like --ui, with a custom onesetup-ui.exe
+              -h, --help           show this help
+
+            EXAMPLES
+              onesetup app                         pack ./app into app_setup.exe
+              onesetup app -o dist/setup.exe -l 5  choose output file and compression level
+              onesetup app --ui -o setup.exe       installer with progress window (steps, log, questions)
+
+            THE INSTALLER
+              Running the generated .exe extracts <dir> to a temporary folder and runs install.bat there (working directory =
+              the extracted folder); the folder is removed afterwards. Without install.bat it only extracts.
+              setup.exe -y   runs without confirmation prompts.
+
+            UI PROTOCOL (with --ui, printed by install.bat to stdout)
+              .title <text>   .info <text>   .warn <text>   .error <text>   .progress <0-100>   .ask <question>
+              .ask answers "yes" or "no" on stdin:  echo .ask Continue?  then  set /p ANS=  and test "%ANS%"=="yes".
+              All other output is kept in the Details log. Keep install.bat ASCII and print localised text from a UTF-8
+              file with "type msg.txt". stdin carries the answers, so do not use pause or choice: ONESETUP_SHELL is set to
+              "ui" (or "headless") for the script, e.g.  if not defined ONESETUP_SHELL pause. Full reference: ui/README.md.
+
+            EXIT CODES
+              onesetup: 0 success, 1 error, 2 no arguments.
+              Generated installer: always 0. The 7zSD module does not pass install.bat's exit code on, so automation cannot
+              detect a failed install from it; have install.bat write its own log or marker file. The UI window does show
+              failures (red badge, log opened).
+            """);
     }
 }

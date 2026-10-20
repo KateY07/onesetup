@@ -22,5 +22,12 @@ file and print it with `type msg.txt` (the file may itself contain `.info ...` l
 The window shows the newest output line as a one-line rolling log under the progress bar; `Details` opens the full log.
 On success the badge turns green with a drawn check, a ripple and confetti; failure turns it red.
 
+`install.bat` runs with `ONESETUP_SHELL=ui` (or `headless`) and with stdin connected to the shell, so do not use `pause`
+or `choice` unguarded: `if not defined ONESETUP_SHELL pause`.
+
+The generated installer always exits 0 (the 7zSD module does not pass the script's exit code on); the shell itself
+returns the script's exit code (2 = cancelled) but the SFX discards it. Automation should rely on a log or marker file
+written by `install.bat`.
+
 Exit code = install.bat exit code (2 = cancelled). Flags: `--headless` (no window, lines printed as `[kind] text`;
 also `ONESETUP_UI=0`; `.ask` answers from `ONESETUP_ASK`, default yes), `--auto-close`, `--no-glass`.
