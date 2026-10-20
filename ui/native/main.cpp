@@ -1,0 +1,1092 @@
+// onesetup-ui: a small native shell that runs install.bat and turns its ".command" output lines into UI.
+//   onesetup-ui [--headless] [--auto-close] [--no-glass] <script.bat> [script arguments]
+// Win32 + DirectComposition + Direct2D/DirectWrite, no third-party code. Exit code = script exit code (2 = cancelled).
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <windowsx.h>
+#include <shellapi.h>
+#include <dwmapi.h>
+#include <d3d11.h>
+#include <dxgi1_3.h>
+#include <d2d1_1.h>
+#include <dwrite.h>
+#include <dcomp.h>
+#include <wrl/client.h>
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <deque>
+#include <functional>
+#include <string>
+#include <thread>
+#include <vector>
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "dcomp.lib")
+
+using Microsoft::WRL::ComPtr;
+
+// ---------------------------------------------------------------- protocol
+enum class Kind { Debug, Info, Warn, Error, Ask, Progress, Title };
+
+static std::wstring Trim(const std::wstring& s, const wchar_t* set = L" \t\r\n")
+{
+    size_t a = s.find_first_not_of(set), b = s.find_last_not_of(set);
+    return a == std::wstring::npos ? L"" : s.substr(a, b - a + 1);
+}
+
+static std::wstring Utf8ToWide(const std::string& s)
+{
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+    return w;
+}
+
+static std::string WideToUtf8(const std::wstring& w)
+{
+    if (w.empty()) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
+    return s;
+}
+
+// A line of install.bat output starting with ".<command>" controls the UI. Anything else (including unknown
+// ".xxx" lines such as ".\tool.exe" output) is plain output, shown as debug.
+static void ParseLine(const std::wstring& line, Kind& kind, std::wstring& text)
+{
+    kind = Kind::Debug;
+    text = line;
+    if (line.size() < 2 || line[0] != L'.') return;
+    size_t i = 1;
+    while (i < line.size() && iswalpha(line[i])) i++;
+    if (i < line.size() && line[i] != L' ' && line[i] != L'\t') return;
+    std::wstring word = line.substr(1, i - 1);
+    std::transform(word.begin(), word.end(), word.begin(), ::towlower);
+    static const struct { const wchar_t* name; Kind kind; } table[] = {
+        { L"debug", Kind::Debug }, { L"info", Kind::Info }, { L"warn", Kind::Warn }, { L"error", Kind::Error },
+        { L"ask", Kind::Ask }, { L"progress", Kind::Progress }, { L"title", Kind::Title } };
+    for (auto& entry : table)
+        if (word == entry.name)
+        {
+            kind = entry.kind;
+            text = Trim(Trim(line.substr(i)), L"'\"");
+            return;
+        }
+}
+
+static int ParsePercent(const std::wstring& text)
+{
+    std::wstring t = Trim(text, L"% \t");
+    if (t.empty() || t.size() > 4) return -1;
+    for (wchar_t c : t) if (c < L'0' || c > L'9') return -1;
+    return std::min(100, _wtoi(t.c_str()));
+}
+
+// ---------------------------------------------------------------- script runner
+static HANDLE g_job = nullptr;
+static std::atomic<bool> g_cancelled{ false };
+
+typedef std::function<void(Kind, const std::wstring&, bool)> LineHandler;
+typedef std::function<bool(const std::wstring&)> AskHandler;
+
+static void ReadLines(HANDLE pipe, const std::function<void(const std::wstring&)>& onLine)
+{
+    std::string pending;
+    char buffer[4096];
+    DWORD got;
+    while (ReadFile(pipe, buffer, sizeof buffer, &got, nullptr) && got > 0)
+    {
+        pending.append(buffer, got);
+        size_t start = 0, nl;
+        while ((nl = pending.find('\n', start)) != std::string::npos)
+        {
+            std::string line = pending.substr(start, nl - start);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            onLine(Utf8ToWide(line));
+            start = nl + 1;
+        }
+        pending.erase(0, start);
+    }
+    if (!pending.empty()) onLine(Utf8ToWide(pending));
+}
+
+static int RunScript(const std::wstring& script, const std::wstring& extra, const LineHandler& onLine, const AskHandler& onAsk)
+{
+    SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
+    HANDLE outR, outW, errR, errW, inR, inW;
+    CreatePipe(&outR, &outW, &sa, 0); SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
+    CreatePipe(&errR, &errW, &sa, 0); SetHandleInformation(errR, HANDLE_FLAG_INHERIT, 0);
+    CreatePipe(&inR, &inW, &sa, 0); SetHandleInformation(inW, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdInput = inR; si.hStdOutput = outW; si.hStdError = errW;
+    std::wstring command = L"cmd.exe /d /s /c \"chcp 65001>nul & call \"" + script + L"\" " + extra + L"\"";
+    std::wstring dir = script.substr(0, script.find_last_of(L"\\/"));
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, dir.c_str(), &si, &pi))
+    {
+        onLine(Kind::Error, L"Could not start the install script.", false);
+        return 1;
+    }
+    CloseHandle(outW); CloseHandle(errW); CloseHandle(inR);
+
+    g_job = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &limits, sizeof limits);
+    AssignProcessToJobObject(g_job, pi.hProcess);
+    ResumeThread(pi.hThread);
+
+    std::thread errors([&] { ReadLines(errR, [&](const std::wstring& line) { onLine(Kind::Debug, line, true); }); });
+    ReadLines(outR, [&](const std::wstring& line)
+    {
+        Kind kind; std::wstring text;
+        ParseLine(line, kind, text);
+        if (kind == Kind::Ask)
+        {
+            const char* answer = onAsk(text) ? "yes\r\n" : "no\r\n";
+            DWORD written;
+            WriteFile(inW, answer, (DWORD)strlen(answer), &written, nullptr);
+        }
+        else onLine(kind, text, false);
+    });
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    errors.join();
+    CloseHandle(outR); CloseHandle(errR); CloseHandle(inW);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    CloseHandle(g_job);
+    g_job = nullptr;
+    return g_cancelled ? 2 : (int)code;
+}
+
+// ---------------------------------------------------------------- UI model
+enum class StepState { Active, Done, Warn, Error };
+struct Step { StepState state; std::wstring text; };
+
+struct Region { D2D1_RECT_F rect; int id; };
+enum { BtnAction = 1, BtnDetails, BtnYes, BtnNo };
+
+static struct Model
+{
+    std::wstring title, scriptName;
+    std::vector<Step> steps;
+    int percent = -1;
+    std::deque<std::wstring> log;
+    int logScroll = 0;
+    bool details = false, finished = false, ask = false, cancelConfirm = false;
+    std::wstring askText;
+    int exitCode = 0;
+    int hover = 0;
+    ULONGLONG askTick = 0, finishTick = 0, tickTick = 0;
+    std::wstring tickCur, tickPrev;
+} g;
+
+struct Event { Kind kind; std::wstring text; bool fromStderr; };
+struct AskRequest { std::wstring text; HANDLE done; bool answer; };
+constexpr UINT WM_EVENT = WM_APP + 1, WM_ASK = WM_APP + 2, WM_DONE = WM_APP + 3;
+constexpr UINT_PTR TimerAnimate = 1, TimerClose = 2;
+
+static HWND g_hwnd;
+static bool g_glass = false, g_autoClose = false;
+static UINT g_dpi = 96;
+static AskRequest* g_pendingAsk = nullptr;
+static std::vector<Region> g_regions;
+
+// ---------------------------------------------------------------- graphics
+static ComPtr<ID3D11Device> d3d;
+static ComPtr<IDXGISwapChain1> swap;
+static ComPtr<ID2D1Factory1> d2dFactory;
+static ComPtr<ID2D1DeviceContext> dc;
+static ComPtr<ID2D1Bitmap1> targetBitmap;
+static ComPtr<IDWriteFactory> dwrite;
+static ComPtr<IDCompositionDevice> dcompDevice;
+static ComPtr<IDCompositionTarget> dcompTarget;
+static ComPtr<IDCompositionVisual> dcompVisual;
+static ComPtr<ID2D1SolidColorBrush> brush;
+static ComPtr<ID2D1StrokeStyle> roundStroke;
+static ComPtr<IDWriteTextFormat> fTitle, fSub, fBody, fSmall, fMono, fButton, fButtonLarge, fButtonBold, fCenter, fPercent, fAsk, fAskIcon;
+
+constexpr float WidthDip = 520.f, HeightDip = 424.f, Pad = 32.f;
+static float Scale() { return g_dpi / 96.f; }
+
+static ComPtr<IDWriteTextFormat> MakeFormat(const wchar_t* family, float size, DWRITE_FONT_WEIGHT weight, bool ellipsis, bool center = false)
+{
+    ComPtr<IDWriteTextFormat> f;
+    dwrite->CreateTextFormat(family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &f);
+    if (ellipsis)
+    {
+        f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        ComPtr<IDWriteInlineObject> sign;
+        dwrite->CreateEllipsisTrimmingSign(f.Get(), &sign);
+        DWRITE_TRIMMING trimming{ DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+        f->SetTrimming(&trimming, sign.Get());
+    }
+    if (center)
+    {
+        f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    return f;
+}
+
+static void CreateTargetBitmap()
+{
+    ComPtr<IDXGISurface> surface;
+    swap->GetBuffer(0, IID_PPV_ARGS(&surface));
+    D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), (float)g_dpi, (float)g_dpi);
+    dc->CreateBitmapFromDxgiSurface(surface.Get(), &props, &targetBitmap);
+    dc->SetTarget(targetBitmap.Get());
+    dc->SetDpi((float)g_dpi, (float)g_dpi);
+}
+
+static bool InitGraphics(int w, int h)
+{
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0, D3D11_SDK_VERSION, &d3d, nullptr, nullptr)) &&
+        FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, nullptr, 0, D3D11_SDK_VERSION, &d3d, nullptr, nullptr)))
+        return false;
+    ComPtr<IDXGIDevice> dxgiDevice;
+    d3d.As(&dxgiDevice);
+    ComPtr<IDXGIAdapter> adapter;
+    dxgiDevice->GetAdapter(&adapter);
+    ComPtr<IDXGIFactory2> factory;
+    adapter->GetParent(IID_PPV_ARGS(&factory));
+
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = w; desc.Height = h;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+    if (FAILED(factory->CreateSwapChainForComposition(d3d.Get(), &desc, nullptr, &swap))) return false;
+
+    D2D1_FACTORY_OPTIONS options{};
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), &options, (void**)d2dFactory.GetAddressOf()))) return false;
+    ComPtr<ID2D1Device> d2dDevice;
+    d2dFactory->CreateDevice(dxgiDevice.Get(), &d2dDevice);
+    d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc);
+    dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    dc->CreateSolidColorBrush(D2D1::ColorF(0, 0), &brush);
+    D2D1_STROKE_STYLE_PROPERTIES stroke = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND);
+    d2dFactory->CreateStrokeStyle(stroke, nullptr, 0, &roundStroke);
+
+    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)dwrite.GetAddressOf());
+    BOOL hasVariable = FALSE;
+    {
+        ComPtr<IDWriteFontCollection> fonts;
+        UINT32 index;
+        dwrite->GetSystemFontCollection(&fonts);
+        fonts->FindFamilyName(L"Segoe UI Variable Text", &index, &hasVariable);
+    }
+    const wchar_t* family = hasVariable ? L"Segoe UI Variable Text" : L"Segoe UI";
+    fTitle = MakeFormat(family, 22, DWRITE_FONT_WEIGHT_SEMI_BOLD, true);
+    fSub = MakeFormat(family, 13, DWRITE_FONT_WEIGHT_NORMAL, true);
+    fBody = MakeFormat(family, 14, DWRITE_FONT_WEIGHT_NORMAL, true);
+    fSmall = MakeFormat(family, 13, DWRITE_FONT_WEIGHT_NORMAL, true);
+    fMono = MakeFormat(L"Consolas", 12, DWRITE_FONT_WEIGHT_NORMAL, true);
+    fButton = MakeFormat(family, 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, true);
+    fButtonLarge = MakeFormat(family, 15, DWRITE_FONT_WEIGHT_NORMAL, false, true);
+    fButtonBold = MakeFormat(family, 15, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, true);
+    fCenter = MakeFormat(family, 15, DWRITE_FONT_WEIGHT_NORMAL, false, true);
+    fPercent = MakeFormat(family, 28, DWRITE_FONT_WEIGHT_LIGHT, true);
+    fPercent->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+    fAsk = MakeFormat(family, 15, DWRITE_FONT_WEIGHT_NORMAL, false);
+    fAskIcon = MakeFormat(family, 22, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, true);
+
+    if (FAILED(DCompositionCreateDevice(dxgiDevice.Get(), IID_PPV_ARGS(&dcompDevice)))) return false;
+    dcompDevice->CreateTargetForHwnd(g_hwnd, TRUE, &dcompTarget);
+    dcompDevice->CreateVisual(&dcompVisual);
+    dcompVisual->SetContent(swap.Get());
+    dcompTarget->SetRoot(dcompVisual.Get());
+    dcompDevice->Commit();
+    CreateTargetBitmap();
+    return true;
+}
+
+static void ResizeGraphics(int w, int h)
+{
+    if (!swap) return;
+    dc->SetTarget(nullptr);
+    targetBitmap.Reset();
+    swap->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    CreateTargetBitmap();
+}
+
+// ---------------------------------------------------------------- layout and drawing
+// Fixed-size window: the card shows either the step list or the details log, so nothing ever resizes.
+// How much white is laid over the Acrylic: lower = more see-through, higher = more readable.
+constexpr float GlassTint = 0.05f, CardGlass = 0.30f;
+constexpr float CardTop = 100.f, CardH = 196.f, RowH = 36.f, BarY = 314.f, LogY = 332.f, FootY = 360.f;
+constexpr int MaxVisibleSteps = 5;
+static float g_shown = 0.f;   // eased progress actually drawn
+
+static float Px(float v) { float s = Scale(); return roundf(v * s) / s; }
+static float Hair() { return 1.f / Scale(); }
+static float Clamp01(float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; }
+static float EaseOut(float t) { t = 1.f - Clamp01(t); return 1.f - t * t * t; }
+static float Since(ULONGLONG start, float ms) { return start ? Clamp01((float)(GetTickCount64() - start) / ms) : 1.f; }
+static float Lerp(float a, float b, float t) { return a + (b - a) * t; }
+
+static bool Animating()
+{
+    ULONGLONG now = GetTickCount64();
+    return !g.finished || g.ask || now - g.finishTick < 2000 || now - g.tickTick < 300 || now - g.askTick < 400;
+}
+
+static void Wake() { SetTimer(g_hwnd, TimerAnimate, 16, nullptr); }
+
+static void Relayout()
+{
+    int w = (int)lroundf(WidthDip * Scale()), h = (int)lroundf(HeightDip * Scale());
+    RECT r;
+    GetWindowRect(g_hwnd, &r);
+    if (r.right - r.left == w && r.bottom - r.top == h) return;
+    SetWindowPos(g_hwnd, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    ResizeGraphics(w, h);
+}
+
+static void SetColor(float r, float g_, float b, float a = 1.f) { brush->SetColor(D2D1::ColorF(r / 255.f, g_ / 255.f, b / 255.f, a)); }
+static void Ink() { SetColor(29, 29, 31); }
+static void Muted() { SetColor(95, 99, 104); }
+static void Blue() { SetColor(10, 132, 255); }
+
+struct Stop { float pos, r, g, b, a; };
+static ComPtr<ID2D1LinearGradientBrush> Linear(float x0, float y0, float x1, float y1, std::initializer_list<Stop> stops, float opacity = 1.f)
+{
+    std::vector<D2D1_GRADIENT_STOP> v;
+    for (auto& s : stops) v.push_back({ s.pos, D2D1::ColorF(s.r / 255.f, s.g / 255.f, s.b / 255.f, s.a) });
+    ComPtr<ID2D1GradientStopCollection> collection;
+    dc->CreateGradientStopCollection(v.data(), (UINT32)v.size(), &collection);
+    ComPtr<ID2D1LinearGradientBrush> b;
+    dc->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1)), collection.Get(), &b);
+    b->SetOpacity(opacity);
+    return b;
+}
+
+static void Text(const std::wstring& s, IDWriteTextFormat* f, float x, float y, float w, float h)
+{
+    dc->DrawText(s.c_str(), (UINT32)s.size(), f, D2D1::RectF(x, y, x + w, y + h), brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+
+static D2D1_ROUNDED_RECT RR(float l, float t, float r, float b, float radius) { return D2D1::RoundedRect(D2D1::RectF(l, t, r, b), radius, radius); }
+
+static void SoftShadow(float l, float t, float r, float b, float radius, float dy, float spread)
+{
+    for (int i = 14; i >= 1; i--)
+    {
+        float grow = i * spread / 14.f;
+        SetColor(20, 30, 60, 0.012f);
+        dc->FillRoundedRectangle(RR(l - grow, t - grow + dy, r + grow, b + grow + dy, radius + grow), brush.Get());
+    }
+}
+
+// Milky glass over Acrylic, plain white otherwise; used by the grouped card and the secondary button.
+static void Surface(const D2D1_ROUNDED_RECT& rr, float glassAlpha)
+{
+    SetColor(255, 255, 255, g_glass ? glassAlpha : 1.f);
+    dc->FillRoundedRectangle(rr, brush.Get());
+    D2D1_ROUNDED_RECT edge = rr;
+    float h = Hair() / 2;
+    edge.rect = D2D1::RectF(rr.rect.left + h, rr.rect.top + h, rr.rect.right - h, rr.rect.bottom - h);
+    if (g_glass) SetColor(255, 255, 255, 0.75f); else SetColor(0, 0, 0, 0.09f);
+    dc->DrawRoundedRectangle(edge, brush.Get(), Hair());
+}
+
+static void Pill(float x, float y, float w, float h, const std::wstring& label, int id, bool primary)
+{
+    bool hot = g.hover == id;
+    D2D1_ROUNDED_RECT rr = RR(x, y, x + w, y + h, h / 2);
+    if (primary)
+    {
+        auto grad = Linear(x, y, x + w, y + h, { { 0.f, 10, 132, 255, 1.f }, { 1.f, 94, 92, 230, 1.f } }, hot ? 0.88f : 1.f);
+        dc->FillRoundedRectangle(rr, grad.Get());
+        SetColor(255, 255, 255);
+    }
+    else
+    {
+        Surface(rr, hot ? 0.85f : 0.6f);
+        Ink();
+    }
+    Text(label, fButton.Get(), x, y, w, h);
+    g_regions.push_back({ D2D1::RectF(x, y, x + w, y + h), id });
+}
+
+static void DrawStepIcon(const Step& s, float cx, float cy, float angle)
+{
+    const float k = 1.25f;
+    if (s.state == StepState::Active)
+    {
+        const float r = 7.5f;
+        ComPtr<ID2D1PathGeometry> path;
+        d2dFactory->CreatePathGeometry(&path);
+        ComPtr<ID2D1GeometrySink> sink;
+        path->Open(&sink);
+        float a0 = angle, a1 = angle + 4.4f;
+        sink->BeginFigure(D2D1::Point2F(cx + r * cosf(a0), cy + r * sinf(a0)), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(cx + r * cosf(a1), cy + r * sinf(a1)), D2D1::SizeF(r, r), 0.f,
+            D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_LARGE));
+        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+        sink->Close();
+        SetColor(10, 132, 255, 0.16f);
+        dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r), brush.Get(), 2.4f);
+        auto grad = Linear(cx - r, cy - r, cx + r, cy + r, { { 0.f, 10, 132, 255, 1.f }, { 1.f, 191, 90, 242, 1.f } });
+        dc->DrawGeometry(path.Get(), grad.Get(), 2.4f, roundStroke.Get());
+        return;
+    }
+    if (s.state == StepState::Done) SetColor(48, 209, 88);
+    else if (s.state == StepState::Warn) SetColor(255, 159, 10);
+    else SetColor(255, 69, 58);
+    dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 10.f, 10.f), brush.Get());
+    SetColor(255, 255, 255);
+    const float sw = 2.2f;
+    if (s.state == StepState::Done)
+    {
+        dc->DrawLine(D2D1::Point2F(cx - 3.6f * k, cy + 0.2f * k), D2D1::Point2F(cx - 1.0f * k, cy + 3.0f * k), brush.Get(), sw, roundStroke.Get());
+        dc->DrawLine(D2D1::Point2F(cx - 1.0f * k, cy + 3.0f * k), D2D1::Point2F(cx + 3.8f * k, cy - 2.8f * k), brush.Get(), sw, roundStroke.Get());
+    }
+    else if (s.state == StepState::Warn)
+    {
+        dc->DrawLine(D2D1::Point2F(cx, cy - 4.6f), D2D1::Point2F(cx, cy + 1.0f), brush.Get(), sw, roundStroke.Get());
+        dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy + 4.4f), 1.3f, 1.3f), brush.Get());
+    }
+    else
+    {
+        dc->DrawLine(D2D1::Point2F(cx - 3.8f, cy - 3.8f), D2D1::Point2F(cx + 3.8f, cy + 3.8f), brush.Get(), sw, roundStroke.Get());
+        dc->DrawLine(D2D1::Point2F(cx + 3.8f, cy - 3.8f), D2D1::Point2F(cx - 3.8f, cy + 3.8f), brush.Get(), sw, roundStroke.Get());
+    }
+}
+
+// The app badge: a blue-violet tile with a download glyph while running; on success it turns green, the glyph
+// becomes a drawn check, a ripple expands and confetti dots burst out. Failure turns it red with a cross.
+static void DrawBadge(float bx, float by, bool failed)
+{
+    const float size = 48.f, cx = bx + size / 2, cy = by + size / 2;
+    float t = g.finished ? Since(g.finishTick, 1100.f) : 0.f;
+    bool ok = g.finished && !failed && !g_cancelled;
+
+    if (ok)
+    {
+        static const float palette[8][3] = { { 10, 132, 255 }, { 94, 92, 230 }, { 191, 90, 242 }, { 255, 55, 95 }, { 255, 159, 10 }, { 48, 209, 88 }, { 100, 210, 255 }, { 255, 214, 10 } };
+        float burst = EaseOut(Clamp01((t - 0.12f) / 0.88f));
+        for (int i = 0; i < 8; i++)
+        {
+            float a = i * 0.7853982f + 0.3f, d = 30.f + 26.f * burst, r = 3.6f * (1.f - burst) + 0.4f;
+            SetColor(palette[i][0], palette[i][1], palette[i][2], 1.f - burst * 0.7f);
+            if (burst < 1.f) dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx + d * cosf(a), cy + d * sinf(a)), r, r), brush.Get());
+        }
+        float ripple = EaseOut(Clamp01((t - 0.05f) / 0.7f));
+        if (ripple < 1.f)
+        {
+            SetColor(48, 209, 88, 0.45f * (1.f - ripple));
+            dc->DrawRoundedRectangle(RR(bx - 22 * ripple, by - 22 * ripple, bx + size + 22 * ripple, by + size + 22 * ripple, 14.f + 22 * ripple), brush.Get(), 2.f);
+        }
+    }
+
+    float pop = ok ? 1.f + 0.12f * sinf(Clamp01(t / 0.45f) * 3.14159f) : 1.f;
+    float half = size / 2 * pop;
+    D2D1_ROUNDED_RECT tile = RR(cx - half, cy - half, cx + half, cy + half, 14.f * pop);
+    SoftShadow(tile.rect.left, tile.rect.top, tile.rect.right, tile.rect.bottom, 14.f, 5.f, 9.f);
+    auto blue = Linear(bx, by, bx + size, by + size, { { 0.f, 10, 132, 255, 1.f }, { 1.f, 94, 92, 230, 1.f } });
+    dc->FillRoundedRectangle(tile, blue.Get());
+    float over = g.finished ? EaseOut(Clamp01(t * 2.2f)) : 0.f;
+    if (over > 0.f)
+    {
+        if (ok)
+        {
+            auto green = Linear(bx, by, bx + size, by + size, { { 0.f, 52, 199, 89, 1.f }, { 1.f, 48, 209, 180, 1.f } }, over);
+            dc->FillRoundedRectangle(tile, green.Get());
+        }
+        else { SetColor(255, 69, 58, over); dc->FillRoundedRectangle(tile, brush.Get()); }
+    }
+
+    SetColor(255, 255, 255);
+    float glyph = 1.f - Clamp01(t * 4.f);
+    if (glyph > 0.f)
+    {
+        SetColor(255, 255, 255, glyph);
+        dc->DrawLine(D2D1::Point2F(cx, cy - 10), D2D1::Point2F(cx, cy + 5), brush.Get(), 2.8f, roundStroke.Get());
+        dc->DrawLine(D2D1::Point2F(cx - 7, cy - 1.5f), D2D1::Point2F(cx, cy + 6), brush.Get(), 2.8f, roundStroke.Get());
+        dc->DrawLine(D2D1::Point2F(cx + 7, cy - 1.5f), D2D1::Point2F(cx, cy + 6), brush.Get(), 2.8f, roundStroke.Get());
+        dc->DrawLine(D2D1::Point2F(cx - 10, cy + 12), D2D1::Point2F(cx + 10, cy + 12), brush.Get(), 2.8f, roundStroke.Get());
+    }
+    if (g.finished && t > 0.2f)
+    {
+        float p = EaseOut(Clamp01((t - 0.2f) / 0.5f));
+        SetColor(255, 255, 255);
+        if (ok)
+        {
+            D2D1_POINT_2F a = D2D1::Point2F(cx - 10, cy + 1), b = D2D1::Point2F(cx - 3.5f, cy + 8), c = D2D1::Point2F(cx + 10, cy - 8);
+            const float l1 = 9.5f, l2 = 19.f, drawn = p * (l1 + l2);
+            if (drawn > 0) dc->DrawLine(a, drawn >= l1 ? b : D2D1::Point2F(Lerp(a.x, b.x, drawn / l1), Lerp(a.y, b.y, drawn / l1)), brush.Get(), 3.4f, roundStroke.Get());
+            if (drawn > l1) { float u = (drawn - l1) / l2; dc->DrawLine(b, D2D1::Point2F(Lerp(b.x, c.x, u), Lerp(b.y, c.y, u)), brush.Get(), 3.4f, roundStroke.Get()); }
+        }
+        else
+        {
+            float e = 9.f * p;
+            dc->DrawLine(D2D1::Point2F(cx - e, cy - e), D2D1::Point2F(cx + e, cy + e), brush.Get(), 3.2f, roundStroke.Get());
+            dc->DrawLine(D2D1::Point2F(cx + e, cy - e), D2D1::Point2F(cx - e, cy + e), brush.Get(), 3.2f, roundStroke.Get());
+        }
+    }
+}
+
+// One-line rolling log: the newest output slides up from below while the previous line fades out above.
+static void DrawTicker()
+{
+    const float h = 18.f, w = WidthDip - 2 * Pad;
+    float t = EaseOut(Since(g.tickTick, 240.f));
+    dc->PushAxisAlignedClip(D2D1::RectF(Pad, LogY, Pad + w, LogY + h), D2D1_ANTIALIAS_MODE_ALIASED);
+    if (t < 1.f && !g.tickPrev.empty())
+    {
+        Muted();
+        brush->SetOpacity(1.f - t);
+        Text(g.tickPrev, fMono.Get(), Pad, LogY - h * t, w, h);
+        brush->SetOpacity(1.f);
+    }
+    if (!g.tickCur.empty())
+    {
+        SetColor(95, 99, 104, 1.f);
+        brush->SetOpacity(t);
+        Text(g.tickCur, fMono.Get(), Pad, LogY + h * (1.f - t), w, h);
+        brush->SetOpacity(1.f);
+    }
+    dc->PopAxisAlignedClip();
+}
+
+// Question sheet: a glass panel that rises from the bottom edge, in the same language as the card and pills.
+static void DrawAskSheet()
+{
+    float e = EaseOut(Since(g.askTick, 260.f));
+    SetColor(255, 255, 255, (g_glass ? 0.50f : 0.70f) * e);
+    dc->FillRectangle(D2D1::RectF(0, 0, WidthDip, HeightDip), brush.Get());
+
+    const float margin = 14.f, sw = WidthDip - 2 * margin, pad = 22.f, iconD = 40.f, btnH = 40.f;
+    ComPtr<IDWriteTextLayout> layout;
+    float textW = sw - 2 * pad - iconD - 16.f;
+    dwrite->CreateTextLayout(g.askText.c_str(), (UINT32)g.askText.size(), fAsk.Get(), textW, 1000.f, &layout);
+    DWRITE_TEXT_METRICS m{};
+    layout->GetMetrics(&m);
+    float textH = std::max(m.height, iconD);
+    float sh = pad + textH + 18.f + btnH + pad - 4.f;
+    float x0 = margin, y0 = HeightDip - margin - sh + (1.f - e) * (sh + 30.f);
+
+    SoftShadow(x0, y0, x0 + sw, y0 + sh, 20.f, -4.f, 22.f);
+    D2D1_ROUNDED_RECT sheet = RR(x0, y0, x0 + sw, y0 + sh, 20.f);
+    SetColor(255, 255, 255, 0.92f);
+    dc->FillRoundedRectangle(sheet, brush.Get());
+    D2D1_ROUNDED_RECT edge = RR(x0 + Hair() / 2, y0 + Hair() / 2, x0 + sw - Hair() / 2, y0 + sh - Hair() / 2, 20.f);
+    SetColor(60, 60, 67, 0.12f);
+    dc->DrawRoundedRectangle(edge, brush.Get(), Hair());
+
+    float ix = x0 + pad, iy = y0 + pad;
+    auto grad = Linear(ix, iy, ix + iconD, iy + iconD, { { 0.f, 10, 132, 255, 1.f }, { 1.f, 94, 92, 230, 1.f } });
+    dc->FillRoundedRectangle(RR(ix, iy, ix + iconD, iy + iconD, 12.f), grad.Get());
+    SetColor(255, 255, 255);
+    Text(L"?", fAskIcon.Get(), ix, iy, iconD, iconD);
+    Ink();
+    dc->DrawTextLayout(D2D1::Point2F(ix + iconD + 16.f, iy + (textH - m.height) / 2), layout.Get(), brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+    float by = y0 + sh - pad - btnH + 4.f;
+    Pill(x0 + sw - pad - 104.f, by, 104.f, btnH, L"Yes", BtnYes, true);
+    Pill(x0 + sw - pad - 104.f - 12.f - 96.f, by, 96.f, btnH, L"No", BtnNo, false);
+}
+
+static void Draw()
+{
+    if (!dc || !targetBitmap) return;
+    g_regions.clear();
+    dc->BeginDraw();
+    const float inner = WidthDip - 2 * Pad;
+    const bool failed = g.finished && g.exitCode != 0;
+    const bool ok = g.finished && !failed && !g_cancelled;
+
+    if (g_glass)
+    {
+        dc->Clear(D2D1::ColorF(0, 0));
+        SetColor(255, 255, 255, GlassTint);
+        dc->FillRectangle(D2D1::RectF(0, 0, WidthDip, HeightDip), brush.Get());
+    }
+    else dc->Clear(D2D1::ColorF(244 / 255.f, 245 / 255.f, 247 / 255.f, 1.f));
+    {   // colour wash: indigo at the top-left, rose at the bottom-right, pulled toward green once done
+        float done = ok ? EaseOut(Since(g.finishTick, 900.f)) : 0.f;
+        auto wash = Linear(0, 0, WidthDip, HeightDip, { { 0.f, Lerp(110, 80, done), Lerp(140, 215, done), Lerp(255, 160, done), g_glass ? 0.20f : 0.12f },
+                                                          { 0.5f, 255, 255, 255, 0.0f },
+                                                          { 1.f, Lerp(255, 120, done), Lerp(150, 230, done), Lerp(205, 200, done), g_glass ? 0.20f : 0.12f } });
+        dc->FillRectangle(D2D1::RectF(0, 0, WidthDip, HeightDip), wash.Get());
+        float h = Hair() / 2;
+        if (g_glass) SetColor(255, 255, 255, 0.55f); else SetColor(0, 0, 0, 0.12f);
+        dc->DrawRoundedRectangle(RR(h, h, WidthDip - h, HeightDip - h, 8.f), brush.Get(), Hair());
+    }
+
+    DrawBadge(Pad, 24.f, failed);
+    const float tx = Pad + 64.f;
+    Ink();
+    Text(g.title.empty() ? g.scriptName : g.title, fTitle.Get(), tx, 24, inner - 64 - 90, 30);
+    std::wstring sub = g.finished ? (g_cancelled ? L"Cancelled" : failed ? L"Failed (exit code " + std::to_wstring(g.exitCode) + L")" : L"Installation complete")
+                                  : g.steps.empty() ? L"Preparing..." : L"Step " + std::to_wstring(g.steps.size());
+    if (failed && !g_cancelled) SetColor(255, 69, 58); else if (ok) SetColor(40, 170, 80); else Muted();
+    Text(sub, fSub.Get(), tx, 54, inner - 64 - 90, 20);
+    if (!g.finished && g.percent >= 0)
+    {
+        auto grad = Linear(WidthDip - Pad - 110, 0, WidthDip - Pad, 0, { { 0.f, 10, 132, 255, 1.f }, { 1.f, 94, 92, 230, 1.f } });
+        dc->DrawText((std::to_wstring((int)lroundf(g_shown)) + L"%").c_str(), (UINT32)(std::to_wstring((int)lroundf(g_shown)).size() + 1), fPercent.Get(),
+            D2D1::RectF(WidthDip - Pad - 110, 28, WidthDip - Pad, 68), grad.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    D2D1_ROUNDED_RECT card = RR(Pad, CardTop, WidthDip - Pad, CardTop + CardH, 14.f);
+    Surface(card, CardGlass);
+    if (ok)
+    {
+        float flash = 1.f - Since(g.finishTick, 1000.f);
+        if (flash > 0.f) { SetColor(48, 209, 88, 0.16f * flash); dc->FillRoundedRectangle(card, brush.Get()); }
+    }
+    if (g.details)
+    {
+        dc->PushAxisAlignedClip(D2D1::RectF(Pad + 14, CardTop + 10, WidthDip - Pad - 14, CardTop + CardH - 10), D2D1_ANTIALIAS_MODE_ALIASED);
+        const float line = 18.f;
+        int visible = (int)((CardH - 20) / line), total = (int)g.log.size();
+        int end = total - g.logScroll, start = std::max(0, end - visible);
+        for (int i = start; i < end; i++)
+        {
+            Muted();
+            Text(g.log[i], fMono.Get(), Pad + 14, CardTop + 10 + (i - start) * line, inner - 28, line);
+        }
+        dc->PopAxisAlignedClip();
+    }
+    else if (g.steps.empty())
+    {
+        Muted();
+        Text(L"Preparing...", fCenter.Get(), Pad, CardTop, inner, CardH);
+    }
+    else
+    {
+        float angle = (float)(GetTickCount64() % 1000) / 1000.f * 6.2831853f;
+        int rows = (int)std::min<size_t>(g.steps.size(), MaxVisibleSteps), first = (int)g.steps.size() - rows;
+        for (int i = 0; i < rows; i++)
+        {
+            const Step& s = g.steps[first + i];
+            float y = CardTop + 10 + i * RowH;
+            if (s.state == StepState::Active)
+            {
+                auto hi = Linear(Pad + 8, y, WidthDip - Pad - 8, y, { { 0.f, 10, 132, 255, 0.16f }, { 1.f, 191, 90, 242, 0.08f } });
+                dc->FillRoundedRectangle(RR(Pad + 8, y, WidthDip - Pad - 8, y + RowH - 2, 9.f), hi.Get());
+            }
+            DrawStepIcon(s, Pad + 28, y + (RowH - 2) / 2, angle);
+            if (s.state == StepState::Done) Muted(); else Ink();
+            Text(s.text, fBody.Get(), Pad + 52, y + 7, inner - 70, 22);
+        }
+    }
+
+    const float bh = 8.f, bw = inner;
+    SetColor(0, 0, 0, 0.08f);
+    dc->FillRoundedRectangle(RR(Pad, BarY, Pad + bw, BarY + bh, 4.f), brush.Get());
+    if (g.percent >= 0 || g.finished)
+    {
+        float frac = (ok ? 100.f : g_shown) / 100.f;
+        float fill = std::max(bh, bw * frac);
+        if (frac > 0.f || g.finished)
+        {
+            D2D1_ROUNDED_RECT bar = RR(Pad, BarY, Pad + fill, BarY + bh, 4.f);
+            if (failed) { SetColor(255, 69, 58); dc->FillRoundedRectangle(bar, brush.Get()); }
+            else
+            {
+                auto violet = Linear(Pad, 0, Pad + bw, 0, { { 0.f, 10, 132, 255, 1.f }, { 0.55f, 94, 92, 230, 1.f }, { 1.f, 191, 90, 242, 1.f } });
+                dc->FillRoundedRectangle(bar, violet.Get());
+                if (ok)
+                {
+                    auto green = Linear(Pad, 0, Pad + bw, 0, { { 0.f, 52, 199, 89, 1.f }, { 1.f, 100, 210, 255, 1.f } }, EaseOut(Since(g.finishTick, 600.f)));
+                    dc->FillRoundedRectangle(bar, green.Get());
+                }
+            }
+        }
+    }
+    else
+    {
+        float t = (float)(GetTickCount64() % 1400) / 1400.f, seg = bw * 0.3f;
+        float x0 = std::max(Pad + (bw + seg) * t - seg, Pad), x1 = std::min(Pad + (bw + seg) * t, Pad + bw);
+        auto grad = Linear(x0, 0, x1 + 1, 0, { { 0.f, 10, 132, 255, 1.f }, { 1.f, 191, 90, 242, 1.f } });
+        if (x1 > x0) dc->FillRoundedRectangle(RR(x0, BarY, x1, BarY + bh, 4.f), grad.Get());
+    }
+
+    DrawTicker();
+
+    if (g.hover == BtnDetails) Ink(); else Muted();
+    Text(g.details ? L"Steps" : L"Details", fSmall.Get(), Pad, FootY + 9, 100, 20);
+    g_regions.push_back({ D2D1::RectF(Pad, FootY + 2, Pad + 100, FootY + 36), BtnDetails });
+    Pill(WidthDip - Pad - 104, FootY, 104, 38, g.finished ? L"Close" : L"Cancel", BtnAction, g.finished && !failed);
+
+    if (g.ask) DrawAskSheet();
+    dc->EndDraw();
+    swap->Present(1, 0);
+}
+
+// ---------------------------------------------------------------- state changes
+static void AddLog(const std::wstring& line)
+{
+    g.log.push_back(line);
+    g.tickPrev = g.tickCur;
+    g.tickCur = Trim(line);
+    g.tickTick = GetTickCount64();
+    if (g.log.size() > 2000) g.log.pop_front();
+}
+
+static void CompleteActive(StepState state)
+{
+    for (auto& s : g.steps) if (s.state == StepState::Active) s.state = state;
+}
+
+static void OnEvent(Event* e)
+{
+    switch (e->kind)
+    {
+    case Kind::Title:
+        g.title = e->text;
+        SetWindowTextW(g_hwnd, (e->text + L" - Setup").c_str());
+        break;
+    case Kind::Progress:
+        if (int p = ParsePercent(e->text); p >= 0) g.percent = p;
+        break;
+    case Kind::Info:
+        CompleteActive(StepState::Done);
+        g.steps.push_back({ StepState::Active, e->text });
+        AddLog(L"info   " + e->text);
+        break;
+    case Kind::Warn:
+        g.steps.push_back({ StepState::Warn, e->text });
+        AddLog(L"warn   " + e->text);
+        break;
+    case Kind::Error:
+        g.steps.push_back({ StepState::Error, e->text });
+        AddLog(L"error  " + e->text);
+        break;
+    default:
+        AddLog((e->fromStderr ? L"stderr " : L"       ") + e->text);
+        break;
+    }
+    Relayout();
+    Wake();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void CloseAsk(bool yes)
+{
+    g.ask = false;
+    if (g.cancelConfirm)
+    {
+        g.cancelConfirm = false;
+        if (yes && !g.finished)
+        {
+            g_cancelled = true;
+            if (g_job) TerminateJobObject(g_job, 2);
+        }
+    }
+    else if (g_pendingAsk)
+    {
+        g_pendingAsk->answer = yes;
+        SetEvent(g_pendingAsk->done);
+        g_pendingAsk = nullptr;
+    }
+    g.hover = 0;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void RequestCancel()
+{
+    if (g.ask) return;
+    g.ask = true;
+    g.askTick = GetTickCount64();
+    Wake();
+    g.cancelConfirm = true;
+    g.askText = L"Cancel setup?";
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static int HitTest(LPARAM lParam, bool screen)
+{
+    POINT p{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    if (screen) ScreenToClient(g_hwnd, &p);
+    float x = p.x / Scale(), y = p.y / Scale();
+    for (auto it = g_regions.rbegin(); it != g_regions.rend(); ++it)
+        if (x >= it->rect.left && x < it->rect.right && y >= it->rect.top && y < it->rect.bottom) return it->id;
+    return 0;
+}
+
+// Frosted glass: Acrylic blur-behind with our own white tint (the system backdrop type paints a fixed grey that
+// hides what is behind the window). Tint is ABGR: 0xAABBGGRR, alpha = how milky the glass is.
+constexpr DWORD AcrylicTint = 0x59FFFFFF;
+
+static bool ApplyAcrylic()
+{
+    struct AccentPolicy { int state, flags; DWORD color; int animation; };
+    struct CompositionData { int attribute; PVOID data; SIZE_T size; };
+    typedef BOOL(WINAPI * SetCompositionFn)(HWND, CompositionData*);
+    auto set = (SetCompositionFn)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
+    if (!set) return false;
+    AccentPolicy policy{ 4 /* ACCENT_ENABLE_ACRYLICBLURBEHIND */, 0, AcrylicTint, 0 };
+    CompositionData data{ 19 /* WCA_ACCENT_POLICY */, &policy, sizeof policy };
+    return set(g_hwnd, &data) != FALSE;
+}
+
+static void ApplyDwm()
+{
+    int corners = 2;   // rounded, anti-aliased by DWM
+    DwmSetWindowAttribute(g_hwnd, 33, &corners, sizeof corners);
+    MARGINS shadow{ 1, 1, 1, 1 };
+    DwmExtendFrameIntoClientArea(g_hwnd, &shadow);   // drop shadow for a borderless window
+    if (g_glass && ApplyAcrylic()) return;
+    g_glass = false;
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_NCCALCSIZE: return 0;
+    case WM_NCHITTEST:
+    {
+        if (g.ask || HitTest(lParam, true)) return HTCLIENT;
+        return HTCAPTION;
+    }
+    case WM_SETCURSOR:
+        if (LOWORD(lParam) == HTCLIENT && g.hover) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+        break;
+    case WM_MOUSEMOVE:
+    {
+        int hot = HitTest(lParam, false);
+        if (hot != g.hover) { g.hover = hot; InvalidateRect(hwnd, nullptr, FALSE); }
+        TRACKMOUSEEVENT t{ sizeof t, TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&t);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g.hover = 0;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONUP:
+        switch (HitTest(lParam, false))
+        {
+        case BtnAction: if (g.finished) DestroyWindow(hwnd); else RequestCancel(); break;
+        case BtnDetails: g.details = !g.details; g.logScroll = 0; Relayout(); InvalidateRect(hwnd, nullptr, FALSE); break;
+        case BtnYes: CloseAsk(true); break;
+        case BtnNo: CloseAsk(false); break;
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (g.details)
+        {
+            g.logScroll = std::max(0, std::min((int)g.log.size() - 1, g.logScroll + (GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 3 : -3)));
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) { if (g.ask) CloseAsk(false); else if (g.finished) DestroyWindow(hwnd); else RequestCancel(); }
+        else if (wParam == VK_RETURN) { if (g.ask) CloseAsk(true); else if (g.finished) DestroyWindow(hwnd); }
+        return 0;
+    case WM_EVENT:
+    {
+        std::unique_ptr<Event> e((Event*)lParam);
+        OnEvent(e.get());
+        return 0;
+    }
+    case WM_ASK:
+        g_pendingAsk = (AskRequest*)lParam;
+        g.ask = true;
+        g.askTick = GetTickCount64();
+        g.cancelConfirm = false;
+        g.askText = g_pendingAsk->text;
+        Wake();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_DONE:
+    {
+        g.exitCode = (int)wParam;
+        g.finished = true;
+        g.finishTick = GetTickCount64();
+        Wake();
+        CompleteActive(g.exitCode == 0 ? StepState::Done : StepState::Error);
+        if (g.exitCode != 0 && !g_cancelled) g.details = true;
+        g.ask = false;
+        Relayout();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        if (g_cancelled) DestroyWindow(hwnd);
+        else if (g_autoClose && g.exitCode == 0) SetTimer(hwnd, TimerClose, 800, nullptr);
+        return 0;
+    }
+    case WM_TIMER:
+        if (wParam == TimerClose) DestroyWindow(hwnd);
+        else
+        {
+            float target = g.finished ? (g.exitCode == 0 ? 100.f : g_shown) : g.percent < 0 ? 0.f : (float)g.percent;
+            g_shown += (target - g_shown) * 0.18f;
+            if (fabsf(target - g_shown) < 0.2f) g_shown = target;
+            if (!Animating() && g_shown == target) KillTimer(hwnd, TimerAnimate);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_DPICHANGED:
+    {
+        g_dpi = HIWORD(wParam);
+        const RECT* r = (const RECT*)lParam;
+        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        dc->SetTarget(nullptr);
+        targetBitmap.Reset();
+        RECT c;
+        GetClientRect(hwnd, &c);
+        swap->ResizeBuffers(0, c.right, c.bottom, DXGI_FORMAT_UNKNOWN, 0);
+        CreateTargetBitmap();
+        Relayout();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_PAINT:
+        ValidateRect(hwnd, nullptr);
+        Draw();
+        return 0;
+    case WM_CLOSE:
+        if (g.finished) DestroyWindow(hwnd); else RequestCancel();
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ---------------------------------------------------------------- entry point
+static void Console(const std::wstring& text)
+{
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!out || out == INVALID_HANDLE_VALUE) return;
+    std::string s = WideToUtf8(text) + "\n";
+    DWORD written;
+    WriteFile(out, s.data(), (DWORD)s.size(), &written, nullptr);
+}
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
+{
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    bool headless = false, noGlass = false;
+    std::vector<std::wstring> rest;
+    for (int i = 1; i < argc; i++)
+    {
+        std::wstring a = argv[i];
+        if (a == L"--headless") headless = true;
+        else if (a == L"--auto-close") g_autoClose = true;
+        else if (a == L"--no-glass") noGlass = true;
+        else rest.push_back(a);
+    }
+    wchar_t env[8];
+    if (GetEnvironmentVariableW(L"ONESETUP_UI", env, 8) && wcscmp(env, L"0") == 0) headless = true;
+    if (rest.empty())
+    {
+        MessageBoxW(nullptr, L"usage: onesetup-ui [--headless] [--auto-close] [--no-glass] <script.bat> [arguments]", L"OneSetup", MB_OK);
+        return 2;
+    }
+    wchar_t full[MAX_PATH * 4];
+    GetFullPathNameW(rest[0].c_str(), (DWORD)std::size(full), full, nullptr);
+    std::wstring script = full, extra;
+    for (size_t i = 1; i < rest.size(); i++)
+        extra += (i > 1 ? L" " : L"") + (rest[i].find(L' ') != std::wstring::npos ? L"\"" + rest[i] + L"\"" : rest[i]);
+    if (GetFileAttributesW(script.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        if (headless) Console(L"script not found: " + script);
+        return 2;
+    }
+    size_t slash = script.find_last_of(L"\\/"), dot = script.find_last_of(L'.');
+    g.scriptName = script.substr(slash + 1, (dot > slash ? dot : script.size()) - slash - 1);
+
+    if (headless)
+    {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+        const wchar_t* names[] = { L"debug", L"info", L"warn", L"error", L"ask", L"progress", L"title" };
+        return RunScript(script, extra,
+            [&](Kind k, const std::wstring& t, bool err) { Console(L"[" + std::wstring(err ? L"stderr" : names[(int)k]) + L"] " + t); },
+            [&](const std::wstring& t)
+            {
+                wchar_t a[8];
+                bool yes = !(GetEnvironmentVariableW(L"ONESETUP_ASK", a, 8) && _wcsicmp(a, L"no") == 0);
+                Console(L"[ask] " + t + L" -> " + (yes ? L"yes" : L"no"));
+                return yes;
+            });
+    }
+
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    WNDCLASSEXW wc{ sizeof wc };
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"OneSetupUi";
+    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    RegisterClassExW(&wc);
+
+    g_glass = !noGlass;
+    g_dpi = GetDpiForSystem();
+    int w = (int)lroundf(WidthDip * Scale()), h = (int)lroundf(HeightDip * Scale());
+    RECT work;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    g_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW, wc.lpszClassName, (g.scriptName + L" - Setup").c_str(), WS_POPUP | WS_MINIMIZEBOX,
+        work.left + (work.right - work.left - w) / 2, work.top + (work.bottom - work.top - h) / 2 - 40, w, h, nullptr, nullptr, instance, nullptr);
+    g_dpi = GetDpiForWindow(g_hwnd);
+    ApplyDwm();
+    RECT client;
+    GetClientRect(g_hwnd, &client);
+    if (!InitGraphics(client.right, client.bottom))
+    {
+        MessageBoxW(nullptr, L"Direct2D is not available; running the script without a window.", L"OneSetup", MB_OK);
+        return RunScript(script, extra, [](Kind, const std::wstring&, bool) {}, [](const std::wstring&) { return true; });
+    }
+    Relayout();
+    ShowWindow(g_hwnd, SW_SHOW);
+    {   // An installer window must come to the front and be active: Windows draws Acrylic as a flat colour on inactive windows.
+        DWORD foreground = GetWindowThreadProcessId(GetForegroundWindow(), nullptr), self = GetCurrentThreadId();
+        if (foreground && foreground != self) AttachThreadInput(self, foreground, TRUE);
+        SetForegroundWindow(g_hwnd);
+        SetActiveWindow(g_hwnd);
+        if (foreground && foreground != self) AttachThreadInput(self, foreground, FALSE);
+    }
+    SetTimer(g_hwnd, TimerAnimate, 16, nullptr);
+
+    std::thread runner([&]
+    {
+        int code = RunScript(script, extra,
+            [](Kind k, const std::wstring& t, bool err) { PostMessageW(g_hwnd, WM_EVENT, 0, (LPARAM) new Event{ k, t, err }); },
+            [](const std::wstring& t)
+            {
+                AskRequest request{ t, CreateEventW(nullptr, TRUE, FALSE, nullptr), false };
+                PostMessageW(g_hwnd, WM_ASK, 0, (LPARAM)&request);
+                WaitForSingleObject(request.done, INFINITE);
+                CloseHandle(request.done);
+                return request.answer;
+            });
+        PostMessageW(g_hwnd, WM_DONE, (WPARAM)code, 0);
+    });
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (g_job) TerminateJobObject(g_job, 2);
+    runner.join();
+    return g.exitCode;
+}

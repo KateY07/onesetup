@@ -107,6 +107,9 @@ static class Program
         Ensure(collisionResult.ExitCode != 0, "A second package operation overwrote an existing output file.");
         Ensure(collisionResult.StandardError.Contains("already exists", StringComparison.OrdinalIgnoreCase), "The output collision error was not reported.");
 
+        await AssertLevelAndProgressAsync(packerPath, sevenZipPath, testRoot, runnerDirectory);
+        await AssertUiPackagingAsync(packerPath, sevenZipPath, sourceDirectory, runnerDirectory);
+
         ProcessResult sfxResult = await RunProcessAsync(
             setupPath,
             ["-y"],
@@ -225,6 +228,49 @@ static class Program
         }
         for (int index = 0; index < expected.Directories.Count; index++)
             Ensure(string.Equals(expected.Directories[index], actual.Directories[index], StringComparison.OrdinalIgnoreCase), $"Directory structure changed: expected '{expected.Directories[index]}', actual '{actual.Directories[index]}'.");
+    }
+
+    static async Task AssertUiPackagingAsync(string packerPath, string sevenZipPath, string sourceDirectory, string runnerDirectory)
+    {
+        string uiSetup = Path.Combine(runnerDirectory, "ui_setup.exe");
+        ProcessResult pack = await RunProcessAsync(packerPath, [sourceDirectory, "-o", uiSetup, "-l", "1", "--ui"], runnerDirectory, timeout: TestTimeout);
+        Ensure(pack.ExitCode == 0, $"Packing with --ui failed. {pack.StandardError}");
+        ProcessResult list = await RunProcessAsync(sevenZipPath, ["l", uiSetup], runnerDirectory, timeout: TestTimeout);
+        Ensure(list.StandardOutput.Contains("onesetup-ui.exe", StringComparison.Ordinal) && list.StandardOutput.Contains("install.bat", StringComparison.Ordinal), "The UI shell or install.bat is missing from the --ui package.");
+        string packageText = Encoding.Latin1.GetString(await File.ReadAllBytesAsync(uiSetup));
+        Ensure(packageText.Contains("ExecuteFile=\"onesetup-ui.exe\"", StringComparison.Ordinal) && packageText.Contains("ExecuteParameters=\"install.bat\"", StringComparison.Ordinal), "The --ui package does not start the UI shell with install.bat.");
+        string emptyDirectory = Path.Combine(runnerDirectory, "no-script");
+        Directory.CreateDirectory(emptyDirectory);
+        ProcessResult rejected = await RunProcessAsync(packerPath, [emptyDirectory, "-o", Path.Combine(runnerDirectory, "never_ui.exe"), "--ui"], runnerDirectory, timeout: TestTimeout);
+        Ensure(rejected.ExitCode != 0, "--ui was accepted without an install.bat.");
+    }
+
+    static async Task AssertLevelAndProgressAsync(string packerPath, string sevenZipPath, string testRoot, string runnerDirectory)
+    {
+        string bulkDirectory = Path.Combine(testRoot, "bulk");
+        Directory.CreateDirectory(bulkDirectory);
+        byte[] repetitive = new byte[8 * 1024 * 1024];
+        for (int index = 0; index < repetitive.Length; index++)
+            repetitive[index] = (byte)(index % 251);
+        await File.WriteAllBytesAsync(Path.Combine(bulkDirectory, "repetitive.bin"), repetitive);
+        byte[] noise = new byte[24 * 1024 * 1024];
+        new Random(7).NextBytes(noise);
+        await File.WriteAllBytesAsync(Path.Combine(bulkDirectory, "noise.bin"), noise);
+
+        string storedPath = Path.Combine(runnerDirectory, "stored_setup.exe");
+        string smallestPath = Path.Combine(runnerDirectory, "smallest_setup.exe");
+        ProcessResult stored = await RunProcessAsync(packerPath, [bulkDirectory, "-o", storedPath, "-l", "0"], runnerDirectory, timeout: TestTimeout);
+        ProcessResult smallest = await RunProcessAsync(packerPath, [bulkDirectory, "--output", smallestPath, "--level", "9"], runnerDirectory, timeout: TestTimeout);
+        Ensure(stored.ExitCode == 0 && smallest.ExitCode == 0, $"Level packing failed. {stored.StandardError} {smallest.StandardError}");
+        Ensure(new FileInfo(storedPath).Length > new FileInfo(smallestPath).Length + 4 * 1024 * 1024, "-l 0 did not store while -l 9 compressed.");
+        Ensure(smallest.StandardOutput.Contains("Packing 100%", StringComparison.Ordinal), $"Packing progress was not reported. STDOUT: {smallest.StandardOutput}");
+        Ensure(!smallest.StandardOutput.Contains("Packing 5%", StringComparison.Ordinal), "Redirected progress should report one line per 10%.");
+
+        foreach (string[] invalid in new[] { new[] { "-l", "10" }, new[] { "-l", "x" }, new[] { "-l" }, new[] { "-l", "1", "--level", "2" } })
+        {
+            ProcessResult rejected = await RunProcessAsync(packerPath, [bulkDirectory, "-o", Path.Combine(runnerDirectory, "never.exe"), .. invalid], runnerDirectory, timeout: TestTimeout);
+            Ensure(rejected.ExitCode != 0 && !File.Exists(Path.Combine(runnerDirectory, "never.exe")), $"Invalid level was accepted: {string.Join(' ', invalid)}");
+        }
     }
 
     static async Task<ProcessResult> RunProcessAsync(

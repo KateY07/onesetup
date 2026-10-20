@@ -2,3 +2,6 @@ bin/
 obj/
 publish/
 *.tmp
+ui/publish/
+vendor/onesetup-ui.exe
+obj/

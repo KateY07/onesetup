@@ -31,8 +31,39 @@ static class Program
             throw new DirectoryNotFoundException($"Source directory not found: {sourceDirectory}");
 
         string? outputArgument = null;
+        string? uiPath = null;
+        bool useUi = false;
+        int level = DefaultLevel;
+        bool levelSpecified = false;
         for (int index = 1; index < args.Length; index++)
         {
+            if (args[index] == "--ui")
+            {
+                useUi = true;
+                continue;
+            }
+
+            if (args[index] == "--ui-exe")
+            {
+                if (++index >= args.Length || !File.Exists(args[index]))
+                    throw new ArgumentException("--ui-exe requires the path of an existing onesetup-ui.exe.");
+
+                useUi = true;
+                uiPath = Path.GetFullPath(args[index]);
+                continue;
+            }
+
+            if (args[index] is "-l" or "--level")
+            {
+                if (levelSpecified)
+                    throw new ArgumentException("Duplicate -l/--level.");
+                if (++index >= args.Length || !int.TryParse(args[index], out level) || level is < 0 or > 9)
+                    throw new ArgumentException("-l/--level requires an integer from 0 (store) to 9 (smallest, slowest).");
+
+                levelSpecified = true;
+                continue;
+            }
+
             if (args[index] is "-o" or "--output")
             {
                 if (++index >= args.Length)
@@ -73,8 +104,21 @@ static class Program
         {
             await WriteEmbeddedResourceAsync("OneSetup.7z.exe", sevenZipPath);
             await WriteEmbeddedResourceAsync("OneSetup.7z.dll", sevenZipLibraryPath);
-            await Create7zArchiveAsync(sevenZipPath, sourceDirectory, archivePath);
-            await WriteSfxConfigAsync(configPath, File.Exists(Path.Combine(sourceDirectory, "install.bat")));
+            bool hasInstallScript = File.Exists(Path.Combine(sourceDirectory, "install.bat"));
+            if (useUi && !hasInstallScript)
+                throw new InvalidOperationException("--ui needs an install.bat in the source directory.");
+
+            await Create7zArchiveAsync(sevenZipPath, sourceDirectory, archivePath, level);
+            if (useUi)
+            {
+                if (uiPath is null)
+                    await WriteEmbeddedResourceAsync("OneSetup.ui.exe", Path.Combine(temporaryDirectory, UiFileName));
+                else
+                    File.Copy(uiPath, Path.Combine(temporaryDirectory, UiFileName));
+                await Create7zArchiveAsync(sevenZipPath, temporaryDirectory, archivePath, level, UiFileName);
+            }
+
+            await WriteSfxConfigAsync(configPath, hasInstallScript, useUi);
             await WriteEmbeddedResourceAsync("OneSetup.7zSD.sfx", sfxModulePath);
             await ConcatenateAsync(temporaryOutput, sfxModulePath, configPath, archivePath);
 
@@ -92,7 +136,12 @@ static class Program
         }
     }
 
-    static async Task Create7zArchiveAsync(string sevenZipPath, string sourceDirectory, string archivePath)
+    const int DefaultLevel = 9;
+
+    const string UiFileName = "onesetup-ui.exe";
+
+    // item "." packs the whole directory with progress; a single file name appends that file silently.
+    static async Task Create7zArchiveAsync(string sevenZipPath, string sourceDirectory, string archivePath, int level, string item = ".")
     {
         ProcessStartInfo startInfo = new()
         {
@@ -105,30 +154,42 @@ static class Program
         };
         startInfo.ArgumentList.Add("a");
         startInfo.ArgumentList.Add("-t7z");
-        startInfo.ArgumentList.Add("-mx=9");
+        startInfo.ArgumentList.Add($"-mx={level}");
+        startInfo.ArgumentList.Add("-bsp1");
+        startInfo.ArgumentList.Add("-bso0");
         startInfo.ArgumentList.Add(archivePath);
-        startInfo.ArgumentList.Add(".");
+        startInfo.ArgumentList.Add(item);
 
         using Process process = new() { StartInfo = startInfo };
         process.Start();
-        Task outputTask = CopyLinesAsync(process.StandardOutput, Console.Out);
+        Task<int> outputTask = ReportProgressAsync(process.StandardOutput, Console.Out, interactive: !Console.IsOutputRedirected);
         Task errorTask = CopyLinesAsync(process.StandardError, Console.Error);
         await process.WaitForExitAsync();
         await Task.WhenAll(outputTask, errorTask);
 
         if (process.ExitCode != 0)
             throw new InvalidOperationException($"7-Zip failed while creating the archive (exit code {process.ExitCode}).");
+
+        // 7-Zip does not always emit a final frame; its exit code confirms completion, so close the display at 100%.
+        int lastPercent = await outputTask;
+        if (item == "." && lastPercent >= 0 && lastPercent < 100)
+            await Console.Out.WriteLineAsync(Console.IsOutputRedirected ? "Packing 100%" : $"{(char)13}Packing 100%");
+        else if (item == "." && lastPercent >= 0 && !Console.IsOutputRedirected)
+            await Console.Out.WriteLineAsync();
     }
 
-    static async Task WriteSfxConfigAsync(string configPath, bool hasInstallScript)
+    static async Task WriteSfxConfigAsync(string configPath, bool hasInstallScript, bool useUi)
     {
         StringBuilder config = new();
         config.AppendLine(";!@Install@!UTF-8!");
         config.AppendLine("Title=\"OneSetup\"");
         config.AppendLine("Progress=\"yes\"");
-        config.AppendLine("OverwriteMode=\"1\"");
-        config.AppendLine("TempMode=\"yes\"");
-        if (hasInstallScript)
+        if (useUi)
+        {
+            config.AppendLine("ExecuteFile=\"onesetup-ui.exe\"");
+            config.AppendLine("ExecuteParameters=\"install.bat\"");
+        }
+        else if (hasInstallScript)
             config.AppendLine("ExecuteFile=\"install.bat\"");
         config.AppendLine(";!@InstallEnd@!");
         await File.WriteAllTextAsync(configPath, config.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
@@ -150,6 +211,52 @@ static class Program
             await using FileStream input = new(inputPath, FileMode.Open, FileAccess.Read, FileShare.Read);
             await input.CopyToAsync(output);
         }
+    }
+
+    // 7-Zip (-bsp1) rewrites one status line in place ("42% 1 + file"), separated by CR. Show only the percentage:
+    // a single updating line on a terminal, or one line per 10% when output is redirected.
+    static async Task<int> ReportProgressAsync(TextReader reader, TextWriter writer, bool interactive)
+    {
+        StringBuilder frame = new();
+        char[] buffer = new char[256];
+        int last = -1;
+        int count;
+        while ((count = await reader.ReadAsync(buffer, 0, buffer.Length)) > 0)
+        {
+            for (int index = 0; index < count; index++)
+            {
+                if (buffer[index] is not ((char)13 or (char)10))
+                {
+                    frame.Append(buffer[index]);
+                    continue;
+                }
+
+                int percent = ParsePercent(frame.ToString());
+                frame.Clear();
+                if (percent < 0 || percent == last || (!interactive && percent != 100 && percent / 10 == last / 10))
+                    continue;
+
+                last = percent;
+                if (interactive)
+                    await writer.WriteAsync($"{(char)13}Packing {percent,3}%");
+                else
+                    await writer.WriteLineAsync($"Packing {percent}%");
+            }
+        }
+
+        return last;
+    }
+
+    static int ParsePercent(string frame)
+    {
+        string text = frame.TrimStart();
+        int digits = 0;
+        while (digits < text.Length && char.IsAsciiDigit(text[digits]))
+            digits++;
+
+        return digits is > 0 and <= 3 && digits < text.Length && text[digits] == '%' && int.Parse(text[..digits]) <= 100
+            ? int.Parse(text[..digits])
+            : -1;
     }
 
     static async Task CopyLinesAsync(TextReader reader, TextWriter writer)
@@ -188,7 +295,11 @@ static class Program
         Console.WriteLine("onesetup - 7-Zip self-extracting archive packer");
         Console.WriteLine();
         Console.WriteLine("Pack a directory:");
-        Console.WriteLine("  onesetup.exe <path-to-dir> [-o <output.exe>]");
+        Console.WriteLine("  onesetup.exe <path-to-dir> [-o <output.exe>] [-l <0-9>] [--ui]");
+        Console.WriteLine();
+        Console.WriteLine("  -o, --output  output file (default: <directory-name>_setup.exe)");
+        Console.WriteLine("  --ui          run install.bat through the built-in UI shell (steps, progress, questions); see ui/README.md");
+        Console.WriteLine("  -l, --level   compression level: 0 = store, 1 = fastest, 9 = smallest (default: 9)");
         Console.WriteLine();
         Console.WriteLine("The default output is <directory-name>_setup.exe in the current directory.");
         Console.WriteLine("The 7z packer and 7zSD.sfx installer module are embedded in onesetup.exe.");
