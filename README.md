@@ -19,6 +19,8 @@
 
 生成的安装包运行时会解压到临时目录并执行其中的 `install.bat`，结束后删除该目录；`setup.exe -y` 跳过确认提示。`--ui-exe <文件>` 与 `--ui` 相同，但使用自定义的 `onesetup-ui.exe`。
 
+`--icon <文件.ico>` 设置生成的 exe 的图标；不指定时使用 OneSetup 自己的图标（安装窗口在任务栏和标题栏也显示它）。ICO 可以带多个尺寸（16–256），`assets/make-icon.ps1` 是生成示例图标的脚本。
+
 `-l/--level` 为压缩等级：`0` 仅存储（最快，适合已压缩内容），`9` 最小体积（默认，最慢）。打包时显示百分比进度：终端中为一行刷新，重定向输出时每 10% 一行。生成的安装包运行时自带解压进度条。
 
 内置的 7zSD 安装模块只识别 `Title`、`BeginPrompt`、`Progress`、`RunProgram`、`Directory`、`ExecuteFile`、`ExecuteParameters` 七个配置项；其他键（如 `OverwriteMode`、`TempMode`）会被忽略，因此不再写入。

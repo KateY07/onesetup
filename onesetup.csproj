@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>onesetup</AssemblyName>
     <RootNamespace>OneSetup</RootNamespace>
+    <ApplicationIcon>assets\onesetup.ico</ApplicationIcon>
     <InvariantGlobalization>true</InvariantGlobalization>
     <!-- The UI shell is built from ui\native (MSVC, C++) on every build and embedded. Pass -p:OneSetupUiExe=<path>
          to embed a prebuilt onesetup-ui.exe instead (no C++ toolchain needed). -->
@@ -19,7 +20,7 @@
     <EmbeddedResource Include="vendor\7z.exe" LogicalName="OneSetup.7z.exe" />
     <EmbeddedResource Include="vendor\7z.dll" LogicalName="OneSetup.7z.dll" />
     <EmbeddedResource Include="$(UiShellExe)" LogicalName="OneSetup.ui.exe" />
-    <UiShellSource Include="ui\native\main.cpp;ui\native\app.manifest;ui\native\build.cmd" />
+    <UiShellSource Include="ui\native\main.cpp;ui\native\app.manifest;ui\native\app.rc;ui\native\build.cmd;assets\onesetup.ico" />
   </ItemGroup>
   <Target Name="BuildUiShell" BeforeTargets="CoreCompile" Inputs="@(UiShellSource)" Outputs="$(UiShellExe)" Condition="'$(OneSetupUiExe)' == ''">
     <Exec Command="&quot;$(MSBuildProjectDirectory)\ui\native\build.cmd&quot; &quot;$(UiShellExe)&quot;" />

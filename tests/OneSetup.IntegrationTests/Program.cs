@@ -113,6 +113,7 @@ static class Program
         await AssertFailureExitCodeAsync(packerPath, runnerDirectory, testRoot);
         await AssertAppModeAsync(packerPath, runnerDirectory, testRoot);
         await AssertChoiceProtocolAsync(packerPath, runnerDirectory, testRoot);
+        await AssertIconAsync(packerPath, runnerDirectory, testRoot);
         await AssertLaunchedProgramSurvivesAsync(packerPath, runnerDirectory, testRoot);
 
         ProcessResult sfxResult = await RunProcessAsync(
@@ -258,6 +259,78 @@ static class Program
         for (int attempt = 0; attempt < 120 && !File.Exists(marker); attempt++)
             await Task.Delay(100);
         Ensure(File.Exists(marker), "The program started by install.bat did not survive the installer.");
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    static extern IntPtr LoadLibraryExW(string fileName, IntPtr reserved, uint flags);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern IntPtr FindResourceW(IntPtr module, IntPtr name, IntPtr type);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern IntPtr LoadResource(IntPtr module, IntPtr resource);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern IntPtr LockResource(IntPtr resource);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern uint SizeofResource(IntPtr module, IntPtr resource);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern bool FreeLibrary(IntPtr module);
+
+    // Resource bytes (type, id) of an executable, or null when it has none.
+    static byte[]? ReadResource(string path, int type, int id)
+    {
+        IntPtr module = LoadLibraryExW(path, IntPtr.Zero, 0x2);   // LOAD_LIBRARY_AS_DATAFILE
+        Ensure(module != IntPtr.Zero, $"Cannot load {path} to inspect its resources.");
+        try
+        {
+            IntPtr resource = FindResourceW(module, id, type);
+            if (resource == IntPtr.Zero) return null;
+            byte[] bytes = new byte[SizeofResource(module, resource)];
+            System.Runtime.InteropServices.Marshal.Copy(LockResource(LoadResource(module, resource)), bytes, 0, bytes.Length);
+            return bytes;
+        }
+        finally { FreeLibrary(module); }
+    }
+
+    // Every setup.exe has the OneSetup icon; --icon replaces it with the given .ico (images 101.., group 1).
+    static async Task AssertIconAsync(string packerPath, string runnerDirectory, string testRoot)
+    {
+        string source = Path.Combine(testRoot, "icon-source");
+        Directory.CreateDirectory(source);
+        await File.WriteAllTextAsync(Path.Combine(source, "install.bat"), "@echo off\r\nexit /b 0\r\n");
+
+        string defaultSetup = Path.Combine(runnerDirectory, "icon_default.exe");
+        ProcessResult plain = await RunProcessAsync(packerPath, [source, "-o", defaultSetup, "-l", "1"], runnerDirectory, timeout: TestTimeout);
+        Ensure(plain.ExitCode == 0, $"Packing failed. {plain.StandardError}");
+        byte[]? defaultGroup = ReadResource(defaultSetup, 14, 1);
+        Ensure(defaultGroup is { Length: > 6 }, "A setup.exe made without --icon has no icon.");
+
+        byte[] imageA = Enumerable.Range(0, 120).Select(i => (byte)(i * 3)).ToArray(), imageB = Enumerable.Range(0, 200).Select(i => (byte)(i * 7)).ToArray();
+        using (MemoryStream ico = new())
+        using (BinaryWriter writer = new(ico))
+        {
+            writer.Write((ushort)0); writer.Write((ushort)1); writer.Write((ushort)2);
+            int offset = 6 + 32;
+            foreach ((byte size, byte[] image) in new[] { ((byte)16, imageA), ((byte)32, imageB) })
+            {
+                writer.Write(size); writer.Write(size); writer.Write((byte)0); writer.Write((byte)0);
+                writer.Write((ushort)1); writer.Write((ushort)32); writer.Write((uint)image.Length); writer.Write((uint)offset);
+                offset += image.Length;
+            }
+            writer.Write(imageA); writer.Write(imageB);
+            await File.WriteAllBytesAsync(Path.Combine(testRoot, "test.ico"), ico.ToArray());
+        }
+
+        string customSetup = Path.Combine(runnerDirectory, "icon_custom.exe");
+        ProcessResult custom = await RunProcessAsync(packerPath, [source, "-o", customSetup, "-l", "1", "--icon", Path.Combine(testRoot, "test.ico")], runnerDirectory, timeout: TestTimeout);
+        Ensure(custom.ExitCode == 0, $"Packing with --icon failed. {custom.StandardError}");
+        byte[]? group = ReadResource(customSetup, 14, 1);
+        Ensure(group is { Length: 6 + 14 * 2 } && BitConverter.ToUInt16(group, 4) == 2, "The custom icon group is wrong.");
+        Ensure(ReadResource(customSetup, 3, 101)!.SequenceEqual(imageA) && ReadResource(customSetup, 3, 102)!.SequenceEqual(imageB), "The custom icon images are wrong.");
+        Ensure(ReadResource(customSetup, 3, 1) is null, "The previous icon images were not removed.");
+
+        string notIcon = Path.Combine(testRoot, "not.ico");
+        await File.WriteAllTextAsync(notIcon, "not an icon");
+        ProcessResult rejected = await RunProcessAsync(packerPath, [source, "-o", Path.Combine(runnerDirectory, "never_icon.exe"), "--icon", notIcon], runnerDirectory, timeout: TestTimeout);
+        Ensure(rejected.ExitCode != 0 && !File.Exists(Path.Combine(runnerDirectory, "never_icon.exe")), "A file that is not an .ico was accepted by --icon.");
     }
 
     // .choose / .ask protocol: the answer reaches install.bat on stdin (headless shell answers from ONESETUP_CHOICE / ONESETUP_ASK).

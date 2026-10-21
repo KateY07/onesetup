@@ -21,6 +21,7 @@ static class Program
         catch (Exception exception)
         {
             Console.Error.WriteLine($"ERROR: {exception.Message}");
+            if (Environment.GetEnvironmentVariable("ONESETUP_DEBUG") == "1") Console.Error.WriteLine(exception);
             return 1;
         }
     }
@@ -34,11 +35,23 @@ static class Program
         string? outputArgument = null;
         string? uiPath = null;
         string? appEntry = null;
+        string? iconPath = null;
         bool useUi = false;
         int level = DefaultLevel;
         bool levelSpecified = false;
         for (int index = 1; index < args.Length; index++)
         {
+            if (args[index] == "--icon")
+            {
+                if (++index >= args.Length || !File.Exists(args[index]))
+                    throw new ArgumentException("--icon requires the path of an existing .ico file.");
+                if (iconPath is not null)
+                    throw new ArgumentException("Duplicate --icon.");
+
+                iconPath = Path.GetFullPath(args[index]);
+                continue;
+            }
+
             if (args[index] == "--app")
             {
                 if (++index >= args.Length || string.IsNullOrWhiteSpace(args[index]))
@@ -145,7 +158,7 @@ static class Program
             await WriteEmbeddedResourceAsync("OneSetup.7zSD.sfx", sfxModulePath);
             string innerPath = Path.Combine(temporaryDirectory, "inner.exe");
             await ConcatenateAsync(innerPath, sfxModulePath, configPath, archivePath);
-            await AssembleInstallerAsync(temporaryOutput, shellPath, innerPath, appEntry is null ? null : (appEntry, Path.Combine(sourceDirectory, appEntry)));
+            await AssembleInstallerAsync(temporaryOutput, shellPath, innerPath, appEntry is null ? null : (appEntry, Path.Combine(sourceDirectory, appEntry)), iconPath);
 
             string? outputDirectory = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(outputDirectory))
@@ -231,9 +244,17 @@ static class Program
     // the file named by ONESETUP_RESULT and returns it as the exit code of setup.exe.
     // App packages (--app): the stub starts <entry> from a per-user cache keyed by the payload hash; the first run
     // extracts into the cache, later runs skip extraction and start the program directly.
-    static async Task AssembleInstallerAsync(string outputPath, string shellPath, string innerPath, (string Entry, string FullPath)? app)
+    static async Task AssembleInstallerAsync(string outputPath, string shellPath, string innerPath, (string Entry, string FullPath)? app, string? iconPath)
     {
-        byte[] shell = await File.ReadAllBytesAsync(shellPath);
+        string stubPath = shellPath;
+        if (iconPath is not null)
+        {
+            // Only the outer stub (the file the user sees) gets the project's icon; the copy inside the payload is untouched.
+            stubPath = shellPath + ".icon.exe";
+            File.Copy(shellPath, stubPath, true);
+            IconResource.Apply(stubPath, iconPath);
+        }
+        byte[] shell = await File.ReadAllBytesAsync(stubPath);
         StringBuilder meta = new();
         if (app is { } appInfo)
         {
@@ -384,13 +405,14 @@ static class Program
             onesetup - pack a directory into a single-file Windows installer
 
             USAGE
-              onesetup <dir> [-o <output.exe>] [-l <0-9>] [--ui | --ui-exe <file> | --app <program>]
+              onesetup <dir> [-o <output.exe>] [-l <0-9>] [--icon <file.ico>] [--ui | --ui-exe <file> | --app <program>]
               onesetup -h | --help
 
             OPTIONS
               -o, --output <file>  output file (default: <dir-name>_setup.exe in the current directory; never overwrites)
               -l, --level <0-9>    compression: 0 store, 1 fastest, 9 smallest (default: 9)
               --ui                 run install.bat through the built-in UI shell (requires install.bat in <dir>)
+              --icon <file.ico>    icon of the generated .exe (default: the OneSetup icon); also shown by the installer window
               --ui-exe <file>      like --ui, with a custom onesetup-ui.exe
               --app <program>      single-file app instead of an installer: the first run extracts to a per-user cache,
                                    later runs start <program> (path inside <dir>) straight from the cache

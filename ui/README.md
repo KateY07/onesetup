@@ -34,3 +34,5 @@ The generated setup.exe returns install.bat's exit code (a small stub in front o
 
 Exit code = install.bat exit code (2 = cancelled). Flags: `--headless` (no window, lines printed as `[kind] text`;
 also `ONESETUP_UI=0`; `.ask` answers from `ONESETUP_ASK`, default yes; `.choose` answers from `ONESETUP_CHOICE`, default 1, `0` = dismissed), `--auto-close`, `--no-glass`.
+
+Icon: the shell carries the OneSetup icon (`assets/onesetup.ico`, embedded by `ui/native/app.rc`), used for the window and as the icon of every setup.exe. `onesetup --icon <file.ico>` replaces it on the generated setup.exe only.
