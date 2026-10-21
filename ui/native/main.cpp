@@ -35,7 +35,7 @@
 using Microsoft::WRL::ComPtr;
 
 // ---------------------------------------------------------------- protocol
-enum class Kind { Debug, Info, Warn, Error, Ask, Progress, Title };
+enum class Kind { Debug, Info, Warn, Error, Ask, Progress, Title, Choose };
 
 static std::wstring Trim(const std::wstring& s, const wchar_t* set = L" \t\r\n")
 {
@@ -75,7 +75,7 @@ static void ParseLine(const std::wstring& line, Kind& kind, std::wstring& text)
     std::transform(word.begin(), word.end(), word.begin(), ::towlower);
     static const struct { const wchar_t* name; Kind kind; } table[] = {
         { L"debug", Kind::Debug }, { L"info", Kind::Info }, { L"warn", Kind::Warn }, { L"error", Kind::Error },
-        { L"ask", Kind::Ask }, { L"progress", Kind::Progress }, { L"title", Kind::Title } };
+        { L"ask", Kind::Ask }, { L"progress", Kind::Progress }, { L"title", Kind::Title }, { L"choose", Kind::Choose } };
     for (auto& entry : table)
         if (word == entry.name)
         {
@@ -83,6 +83,27 @@ static void ParseLine(const std::wstring& line, Kind& kind, std::wstring& text)
             text = Trim(Trim(line.substr(i)), L"'\"");
             return;
         }
+}
+
+// ".ask Question | Yes label | No label" (labels optional, '|' only) and ".choose Prompt | A | B | C" ('|' or ';', 2 to 5 options).
+constexpr size_t MaxChoices = 5;
+static void ParseChoices(const std::wstring& text, bool yesNo, std::wstring& prompt, std::vector<std::wstring>& options)
+{
+    wchar_t separator = (!yesNo && text.find(L'|') == std::wstring::npos) ? L';' : L'|';
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    for (;;)
+    {
+        size_t at = text.find(separator, start);
+        parts.push_back(Trim(text.substr(start, at == std::wstring::npos ? std::wstring::npos : at - start)));
+        if (at == std::wstring::npos) break;
+        start = at + 1;
+    }
+    prompt = parts[0];
+    options.clear();
+    for (size_t i = 1; i < parts.size() && options.size() < MaxChoices; i++)
+        if (!parts[i].empty()) options.push_back(parts[i]);
+    if (yesNo && options.size() != 2) options = { L"Yes", L"No" };
 }
 
 static int ParsePercent(const std::wstring& text)
@@ -98,7 +119,8 @@ static HANDLE g_job = nullptr;
 static std::atomic<bool> g_cancelled{ false };
 
 typedef std::function<void(Kind, const std::wstring&, bool)> LineHandler;
-typedef std::function<bool(const std::wstring&)> AskHandler;
+// Returns the 1-based number of the chosen option, 0 when cancelled. Yes/no questions: 1 = yes, anything else = no.
+typedef std::function<int(const std::wstring&, const std::vector<std::wstring>&, bool)> AskHandler;
 
 // Reads lines until the script's own process has exited and the pipe is drained. It must not wait for EOF: a program
 // the script starts (for example "start app.exe") inherits the pipe and would keep the installer window open.
@@ -165,11 +187,20 @@ static int RunScript(const std::wstring& script, const std::wstring& extra, cons
     {
         Kind kind; std::wstring text;
         ParseLine(line, kind, text);
-        if (kind == Kind::Ask)
+        if (kind == Kind::Ask || kind == Kind::Choose)
         {
-            const char* answer = onAsk(text) ? "yes\r\n" : "no\r\n";
+            const bool yesNo = kind == Kind::Ask;
+            std::wstring prompt;
+            std::vector<std::wstring> options;
+            ParseChoices(text, yesNo, prompt, options);
+            int picked = 0;
+            if (!yesNo && options.size() < 2) onLine(Kind::Error, L"choose needs a prompt and 2 to 5 options separated by | or ;", false);
+            else picked = onAsk(prompt, options, yesNo);
+            std::string answer = yesNo ? (picked == 1 ? "yes" : "no") : std::to_string(picked);
+            answer += (char)13;
+            answer += (char)10;
             DWORD written;
-            WriteFile(inW, answer, (DWORD)strlen(answer), &written, nullptr);
+            WriteFile(inW, answer.data(), (DWORD)answer.size(), &written, nullptr);
         }
         else onLine(kind, text, false);
     });
@@ -189,7 +220,7 @@ enum class StepState { Active, Done, Warn, Error };
 struct Step { StepState state; std::wstring text; };
 
 struct Region { D2D1_RECT_F rect; int id; };
-enum { BtnAction = 1, BtnDetails, BtnYes, BtnNo };
+enum { BtnAction = 1, BtnDetails, BtnYes, BtnNo, BtnChoice = 100 };   // BtnChoice + i: option i of a .choose sheet
 
 static struct Model
 {
@@ -200,6 +231,8 @@ static struct Model
     int logScroll = 0;
     bool details = false, finished = false, ask = false, cancelConfirm = false;
     std::wstring askText;
+    std::vector<std::wstring> choices;   // option labels of the open sheet; yes/no sheets use [yes label, no label]
+    bool yesNo = true;
     int exitCode = 0;
     int hover = 0;
     ULONGLONG askTick = 0, finishTick = 0, tickTick = 0;
@@ -207,7 +240,7 @@ static struct Model
 } g;
 
 struct Event { Kind kind; std::wstring text; bool fromStderr; };
-struct AskRequest { std::wstring text; HANDLE done; bool answer; };
+struct AskRequest { std::wstring text; std::vector<std::wstring> options; bool yesNo; HANDLE done; int answer; };
 constexpr UINT WM_EVENT = WM_APP + 1, WM_ASK = WM_APP + 2, WM_DONE = WM_APP + 3;
 constexpr UINT_PTR TimerAnimate = 1, TimerClose = 2;
 
@@ -580,6 +613,15 @@ static void DrawTicker()
     dc->PopAxisAlignedClip();
 }
 
+static float LabelWidth(const std::wstring& label)
+{
+    ComPtr<IDWriteTextLayout> layout;
+    dwrite->CreateTextLayout(label.c_str(), (UINT32)label.size(), fButton.Get(), 400.f, 40.f, &layout);
+    DWRITE_TEXT_METRICS metrics{};
+    layout->GetMetrics(&metrics);
+    return metrics.widthIncludingTrailingWhitespace;
+}
+
 // Question sheet: a glass panel that rises from the bottom edge, in the same language as the card and pills.
 static void DrawAskSheet()
 {
@@ -594,7 +636,8 @@ static void DrawAskSheet()
     DWRITE_TEXT_METRICS m{};
     layout->GetMetrics(&m);
     float textH = std::max(m.height, iconD);
-    float sh = pad + textH + 18.f + btnH + pad - 4.f;
+    float sh = g.yesNo ? pad + textH + 18.f + btnH + pad - 4.f
+                       : pad + textH + 16.f + g.choices.size() * (btnH + 8.f) - 8.f + pad - 4.f;
     float x0 = margin, y0 = HeightDip - margin - sh + (1.f - e) * (sh + 30.f);
 
     SoftShadow(x0, y0, x0 + sw, y0 + sh, 20.f, -4.f, 22.f);
@@ -613,9 +656,19 @@ static void DrawAskSheet()
     Ink();
     dc->DrawTextLayout(D2D1::Point2F(ix + iconD + 16.f, iy + (textH - m.height) / 2), layout.Get(), brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
-    float by = y0 + sh - pad - btnH + 4.f;
-    Pill(x0 + sw - pad - 104.f, by, 104.f, btnH, L"Yes", BtnYes, true);
-    Pill(x0 + sw - pad - 104.f - 12.f - 96.f, by, 96.f, btnH, L"No", BtnNo, false);
+    if (g.yesNo)
+    {
+        float by = y0 + sh - pad - btnH + 4.f;
+        float yesW = std::max(104.f, LabelWidth(g.choices[0]) + 40.f), noW = std::max(96.f, LabelWidth(g.choices[1]) + 40.f);
+        Pill(x0 + sw - pad - yesW, by, yesW, btnH, g.choices[0], BtnYes, true);
+        Pill(x0 + sw - pad - yesW - 12.f - noW, by, noW, btnH, g.choices[1], BtnNo, false);
+    }
+    else
+    {
+        float by = iy + textH + 16.f;
+        for (size_t i = 0; i < g.choices.size(); i++, by += btnH + 8.f)
+            Pill(x0 + pad, by, sw - 2 * pad, btnH, g.choices[i], BtnChoice + (int)i, i == 0);
+    }
 }
 
 static void Draw()
@@ -795,13 +848,14 @@ static void OnEvent(Event* e)
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
-static void CloseAsk(bool yes)
+// index: 1-based option number, 0 = dismissed. For yes/no sheets 1 means yes.
+static void AnswerAsk(int index)
 {
     g.ask = false;
     if (g.cancelConfirm)
     {
         g.cancelConfirm = false;
-        if (yes && !g.finished)
+        if (index == 1 && !g.finished)
         {
             g_cancelled = true;
             if (g_job) TerminateJobObject(g_job, 2);
@@ -809,13 +863,15 @@ static void CloseAsk(bool yes)
     }
     else if (g_pendingAsk)
     {
-        g_pendingAsk->answer = yes;
+        g_pendingAsk->answer = index;
         SetEvent(g_pendingAsk->done);
         g_pendingAsk = nullptr;
     }
     g.hover = 0;
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
+
+static void CloseAsk(bool yes) { AnswerAsk(yes ? 1 : (g.yesNo ? 2 : 0)); }
 
 static void RequestCancel()
 {
@@ -824,6 +880,8 @@ static void RequestCancel()
     g.askTick = GetTickCount64();
     Wake();
     g.cancelConfirm = true;
+    g.yesNo = true;
+    g.choices = { L"Yes", L"No" };
     g.askText = L"Cancel setup?";
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
@@ -894,8 +952,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         {
         case BtnAction: if (g.finished) DestroyWindow(hwnd); else RequestCancel(); break;
         case BtnDetails: g.details = !g.details; g.logScroll = 0; Relayout(); InvalidateRect(hwnd, nullptr, FALSE); break;
-        case BtnYes: CloseAsk(true); break;
-        case BtnNo: CloseAsk(false); break;
+        case BtnYes: AnswerAsk(1); break;
+        case BtnNo: AnswerAsk(2); break;
+        default:
+            if (int hit = HitTest(lParam, false); hit >= BtnChoice && g.ask) AnswerAsk(hit - BtnChoice + 1);
+            break;
         }
         return 0;
     case WM_MOUSEWHEEL:
@@ -908,6 +969,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) { if (g.ask) CloseAsk(false); else if (g.finished) DestroyWindow(hwnd); else RequestCancel(); }
         else if (wParam == VK_RETURN) { if (g.ask) CloseAsk(true); else if (g.finished) DestroyWindow(hwnd); }
+        else if (g.ask && !g.yesNo)
+        {
+            int number = wParam >= '1' && wParam <= '9' ? (int)(wParam - '0') : wParam >= VK_NUMPAD1 && wParam <= VK_NUMPAD9 ? (int)(wParam - VK_NUMPAD0) : 0;
+            if (number >= 1 && number <= (int)g.choices.size()) AnswerAsk(number);
+        }
         return 0;
     case WM_EVENT:
     {
@@ -920,6 +986,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g.ask = true;
         g.askTick = GetTickCount64();
         g.cancelConfirm = false;
+        g.yesNo = g_pendingAsk->yesNo;
+        g.choices = g_pendingAsk->options;
         g.askText = g_pendingAsk->text;
         Wake();
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -1353,15 +1421,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     {
         AttachConsole(ATTACH_PARENT_PROCESS);
         SetEnvironmentVariableW(L"ONESETUP_SHELL", L"headless");
-        const wchar_t* names[] = { L"debug", L"info", L"warn", L"error", L"ask", L"progress", L"title" };
+        const wchar_t* names[] = { L"debug", L"info", L"warn", L"error", L"ask", L"progress", L"title", L"choose" };
         int headlessCode = RunScript(script, extra,
             [&](Kind k, const std::wstring& t, bool err) { Console(L"[" + std::wstring(err ? L"stderr" : names[(int)k]) + L"] " + t); },
-            [&](const std::wstring& t)
+            [&](const std::wstring& t, const std::vector<std::wstring>& options, bool yesNo)
             {
                 wchar_t a[8];
-                bool yes = !(GetEnvironmentVariableW(L"ONESETUP_ASK", a, 8) && _wcsicmp(a, L"no") == 0);
-                Console(L"[ask] " + t + L" -> " + (yes ? L"yes" : L"no"));
-                return yes;
+                if (yesNo)
+                {
+                    bool yes = !(GetEnvironmentVariableW(L"ONESETUP_ASK", a, 8) && _wcsicmp(a, L"no") == 0);
+                    Console(L"[ask] " + t + L" -> " + (yes ? L"yes" : L"no"));
+                    return yes ? 1 : 2;
+                }
+                int pick = GetEnvironmentVariableW(L"ONESETUP_CHOICE", a, 8) ? _wtoi(a) : 1;   // ONESETUP_CHOICE=0 simulates dismissing the sheet
+                if (pick < 0 || pick > (int)options.size()) pick = 0;
+                std::wstring list;
+                for (size_t i = 0; i < options.size(); i++) list += (i ? L" | " : L"") + options[i];
+                Console(L"[choose] " + t + L" (" + list + L") -> " + std::to_wstring(pick) + (pick ? L" (" + options[pick - 1] + L")" : L""));
+                return pick;
             });
         WriteResult(headlessCode);
         return headlessCode;
@@ -1391,7 +1468,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     if (!InitGraphics(client.right, client.bottom))
     {
         MessageBoxW(nullptr, L"Direct2D is not available; running the script without a window.", L"OneSetup", MB_OK);
-        int fallbackCode = RunScript(script, extra, [](Kind, const std::wstring&, bool) {}, [](const std::wstring&) { return true; });
+        int fallbackCode = RunScript(script, extra, [](Kind, const std::wstring&, bool) {}, [](const std::wstring&, const std::vector<std::wstring>&, bool) { return 1; });
         WriteResult(fallbackCode);
         return fallbackCode;
     }
@@ -1410,9 +1487,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     {
         int code = RunScript(script, extra,
             [](Kind k, const std::wstring& t, bool err) { PostMessageW(g_hwnd, WM_EVENT, 0, (LPARAM) new Event{ k, t, err }); },
-            [](const std::wstring& t)
+            [](const std::wstring& t, const std::vector<std::wstring>& options, bool yesNo)
             {
-                AskRequest request{ t, CreateEventW(nullptr, TRUE, FALSE, nullptr), false };
+                AskRequest request{ t, options, yesNo, CreateEventW(nullptr, TRUE, FALSE, nullptr), 0 };
                 PostMessageW(g_hwnd, WM_ASK, 0, (LPARAM)&request);
                 WaitForSingleObject(request.done, INFINITE);
                 CloseHandle(request.done);

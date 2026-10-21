@@ -415,8 +415,12 @@ static class Program
               ONESETUP_CACHE overrides the cache folder. Cache entries of older builds are not removed automatically.
 
             UI PROTOCOL (with --ui, printed by install.bat to stdout)
-              .title <text>   .info <text>   .warn <text>   .error <text>   .progress <0-100>   .ask <question>
-              .ask answers "yes" or "no" on stdin:  echo .ask Continue?  then  set /p ANS=  and test "%ANS%"=="yes".
+              .title <text>   .info <text>   .warn <text>   .error <text>   .progress <0-100>
+              .ask <question> [| yes label | no label]   answers "yes" or "no" on stdin:
+                  echo .ask Continue?  then  set /p ANS=  and test "%ANS%"=="yes".
+              .choose <prompt>; <option 1>; <option 2>; ...   2 to 5 options, ';' or '|' as separator ('|' needs ^| in .bat);
+                  the 1-based number of the chosen option arrives on stdin (0 = dismissed):  set /p PICK=
+                  Keys: 1-5 pick, Enter = first option, Esc = dismiss.
               All other output is kept in the Details log. Keep install.bat ASCII and print localised text from a UTF-8
               file with "type msg.txt". stdin carries the answers, so do not use pause or choice: ONESETUP_SHELL is set to
               "ui" (or "headless") for the script, e.g.  if not defined ONESETUP_SHELL pause. Full reference: ui/README.md.

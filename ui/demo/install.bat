@@ -15,6 +15,11 @@ if /i not "%ANS%"=="yes" (
     exit /b 1
 )
 
+echo .choose Which flavour of demo do you want?; Standard; Extra crunchy; Minimal
+set "PICK="
+set /p PICK=
+echo You picked option %PICK%.
+
 type msg-copy.txt
 for %%P in (20 40 60) do (
     echo .progress %%P

@@ -112,6 +112,7 @@ static class Program
         await AssertUiPackagingAsync(packerPath, sevenZipPath, sourceDirectory, runnerDirectory);
         await AssertFailureExitCodeAsync(packerPath, runnerDirectory, testRoot);
         await AssertAppModeAsync(packerPath, runnerDirectory, testRoot);
+        await AssertChoiceProtocolAsync(packerPath, runnerDirectory, testRoot);
         await AssertLaunchedProgramSurvivesAsync(packerPath, runnerDirectory, testRoot);
 
         ProcessResult sfxResult = await RunProcessAsync(
@@ -257,6 +258,37 @@ static class Program
         for (int attempt = 0; attempt < 120 && !File.Exists(marker); attempt++)
             await Task.Delay(100);
         Ensure(File.Exists(marker), "The program started by install.bat did not survive the installer.");
+    }
+
+    // .choose / .ask protocol: the answer reaches install.bat on stdin (headless shell answers from ONESETUP_CHOICE / ONESETUP_ASK).
+    static async Task AssertChoiceProtocolAsync(string packerPath, string runnerDirectory, string testRoot)
+    {
+        string source = Path.Combine(testRoot, "choice-source");
+        Directory.CreateDirectory(source);
+        await File.WriteAllTextAsync(Path.Combine(source, "install.bat"),
+            "@echo off\r\n" +
+            "echo .choose Which flavour?; Standard; Extra crunchy; Minimal\r\nset \"PICK=\"\r\nset /p PICK=\r\n>\"%CHOICE_OUT%\" echo picked=%PICK%\r\n" +
+            "echo .choose Pipe separated ^| Red ^| Green\r\nset \"PIPE=\"\r\nset /p PIPE=\r\n>>\"%CHOICE_OUT%\" echo pipe=%PIPE%\r\n" +
+            "echo .ask Really? ^| Absolutely ^| Not now\r\nset \"ANS=\"\r\nset /p ANS=\r\n>>\"%CHOICE_OUT%\" echo ask=%ANS%\r\n" +
+            "echo .choose one option only\r\nset \"BAD=\"\r\nset /p BAD=\r\n>>\"%CHOICE_OUT%\" echo bad=%BAD%\r\n" +
+            "exit /b 0\r\n");
+        string setup = Path.Combine(runnerDirectory, "choice_setup.exe");
+        ProcessResult pack = await RunProcessAsync(packerPath, [source, "-o", setup, "-l", "1", "--ui"], runnerDirectory, timeout: TestTimeout);
+        Ensure(pack.ExitCode == 0, $"Packing failed. {pack.StandardError}");
+
+        async Task<string> Run(string choice, string ask)
+        {
+            string output = Path.Combine(testRoot, $"choice-{choice}-{ask}.txt");
+            ProcessResult run = await RunProcessAsync(setup, ["-y"], runnerDirectory,
+                new Dictionary<string, string?> { ["ONESETUP_UI"] = "0", ["ONESETUP_CHOICE"] = choice, ["ONESETUP_ASK"] = ask, ["CHOICE_OUT"] = output }, TestTimeout);
+            Ensure(run.ExitCode == 0 && File.Exists(output), $"Choice run failed ({run.ExitCode}). {run.StandardError}");
+            return string.Join(' ', File.ReadAllLines(output).Select(line => line.Trim()));
+        }
+
+        Ensure(await Run("2", "yes") == "picked=2 pipe=2 ask=yes bad=0", "Picking option 2 did not reach install.bat (semicolon and pipe separators, labelled ask, too few options).");
+        Ensure(await Run("1", "no") == "picked=1 pipe=1 ask=no bad=0", "The first option or the no answer did not reach install.bat.");
+        Ensure(await Run("0", "yes") == "picked=0 pipe=0 ask=yes bad=0", "Dismissing a choice did not answer 0.");
+        Ensure(await Run("9", "yes") == "picked=0 pipe=0 ask=yes bad=0", "An out-of-range choice did not answer 0.");
     }
 
     // --app: first run extracts into a per-user cache keyed by the payload hash, later runs start the program directly.

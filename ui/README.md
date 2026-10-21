@@ -13,7 +13,8 @@ unavailable the window falls back to a flat white card. Fixed 520x392 DIP window
 | `.info text` | new step in the checklist (previous step is ticked) |
 | `.warn text` / `.error text` | amber / red row |
 | `.progress 79` or `79%` | progress bar |
-| `.ask text` | Yes/No sheet; the answer `yes` or `no` is written to stdin: `set /p ANS=` |
+| `.ask text` | Yes/No sheet; the answer `yes` or `no` is written to stdin: `set /p ANS=`. Custom labels: `.ask Really? ^| Absolutely ^| Not now` (in a `.bat` the pipe must be written `^|`) |
+| `.choose prompt; A; B; C` | Multiple choice, 2 to 5 options (a vertical list in the window). `;` or `\|` separates the parts. The **1-based number** of the chosen option is written to stdin (`0` = dismissed): `set /p PICK=`. Keys: `1`-`5` pick, Enter = first option, Esc = dismiss. Fewer than 2 options is reported as an error and answered `0` |
 | anything else | plain output, kept in the collapsible Details log (stderr too) |
 
 Keep `install.bat` ASCII: `cmd` can cut a UTF-8 line that crosses its 512-byte read block. Put localised text in a UTF-8
@@ -32,4 +33,4 @@ The generated setup.exe returns install.bat's exit code (a small stub in front o
 7zSD itself always exits 0). Cancelling in the window returns 2; a failure to extract or start returns non-zero.
 
 Exit code = install.bat exit code (2 = cancelled). Flags: `--headless` (no window, lines printed as `[kind] text`;
-also `ONESETUP_UI=0`; `.ask` answers from `ONESETUP_ASK`, default yes), `--auto-close`, `--no-glass`.
+also `ONESETUP_UI=0`; `.ask` answers from `ONESETUP_ASK`, default yes; `.choose` answers from `ONESETUP_CHOICE`, default 1, `0` = dismissed), `--auto-close`, `--no-glass`.
