@@ -286,7 +286,6 @@ footer a{text-decoration:none}footer a:hover{color:var(--ink)}
     function find(re){return r.assets.filter(function(x){return re.test(x.name)})[0]}
     var setup=find(/onesetup-setup\.exe$/);
     $('ver').textContent=r.tag_name;
-    $('download').href=r.html_url;   // the release page lists the installer, the portable exe and the checksums
     if(setup){$('meta').textContent='onesetup-setup.exe · '+(setup.size/1048576).toFixed(0)+' MB · packed by OneSetup itself · adds onesetup to your user PATH, then a harmless demo · Windows 10 / 11 · x64'}
   }).catch(function(){});
 
