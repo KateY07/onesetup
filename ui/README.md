@@ -10,6 +10,7 @@ unavailable the window falls back to a flat white card. Fixed 520x392 DIP window
 | Line | Effect |
 |---|---|
 | `.title text` | window heading |
+| `.launch path` or `.launch path \| label` | "Launch after install": once the script succeeds, the done screen shows a primary **Launch** button (custom label optional; Enter also launches). It starts `path` (its folder is the working directory) and closes the window. Not offered on failure or cancel; headless prints `[launch] path` and starts nothing. Use a full path, e.g. `.launch %TARGET%pp.exe` |
 | `.info text` | new step in the checklist (previous step is ticked) |
 | `.warn text` / `.error text` | amber / red row |
 | `.progress 79` or `79%` | progress bar |

@@ -35,7 +35,7 @@
 using Microsoft::WRL::ComPtr;
 
 // ---------------------------------------------------------------- protocol
-enum class Kind { Debug, Info, Warn, Error, Ask, Progress, Title, Choose };
+enum class Kind { Debug, Info, Warn, Error, Ask, Progress, Title, Choose, Launch };
 
 static std::wstring Trim(const std::wstring& s, const wchar_t* set = L" \t\r\n")
 {
@@ -75,7 +75,7 @@ static void ParseLine(const std::wstring& line, Kind& kind, std::wstring& text)
     std::transform(word.begin(), word.end(), word.begin(), ::towlower);
     static const struct { const wchar_t* name; Kind kind; } table[] = {
         { L"debug", Kind::Debug }, { L"info", Kind::Info }, { L"warn", Kind::Warn }, { L"error", Kind::Error },
-        { L"ask", Kind::Ask }, { L"progress", Kind::Progress }, { L"title", Kind::Title }, { L"choose", Kind::Choose } };
+        { L"ask", Kind::Ask }, { L"progress", Kind::Progress }, { L"title", Kind::Title }, { L"choose", Kind::Choose }, { L"launch", Kind::Launch } };
     for (auto& entry : table)
         if (word == entry.name)
         {
@@ -220,11 +220,12 @@ enum class StepState { Active, Done, Warn, Error };
 struct Step { StepState state; std::wstring text; };
 
 struct Region { D2D1_RECT_F rect; int id; };
-enum { BtnAction = 1, BtnDetails, BtnYes, BtnNo, BtnChoice = 100 };   // BtnChoice + i: option i of a .choose sheet
+enum { BtnAction = 1, BtnDetails, BtnYes, BtnNo, BtnLaunch, BtnChoice = 100 };   // BtnChoice + i: option i of a .choose sheet
 
 static struct Model
 {
     std::wstring title, scriptName;
+    std::wstring launchPath, launchLabel;   // ".launch path | label": offered as a button once the install succeeded
     std::vector<Step> steps;
     int percent = -1;
     std::deque<std::wstring> log;
@@ -793,7 +794,9 @@ static void Draw()
     if (g.hover == BtnDetails) Ink(); else Muted();
     Text(g.details ? L"Steps" : L"Details", fSmall.Get(), Pad, FootY + 9, 100, 20);
     g_regions.push_back({ D2D1::RectF(Pad, FootY + 2, Pad + 100, FootY + 36), BtnDetails });
-    Pill(WidthDip - Pad - 104, FootY, 104, 38, g.finished ? L"Close" : L"Cancel", BtnAction, g.finished && !failed);
+    const bool canLaunch = ok && !g.launchPath.empty();
+    Pill(WidthDip - Pad - 104, FootY, 104, 38, g.finished ? L"Close" : L"Cancel", BtnAction, g.finished && !failed && !canLaunch);
+    if (canLaunch) Pill(WidthDip - Pad - 104 - 12 - 150, FootY, 150, 38, g.launchLabel.empty() ? L"Launch" : g.launchLabel, BtnLaunch, true);
 
     if (g.ask) DrawAskSheet();
     dc->EndDraw();
@@ -815,6 +818,18 @@ static void CompleteActive(StepState state)
     for (auto& s : g.steps) if (s.state == StepState::Active) s.state = state;
 }
 
+// Starts the program named by ".launch" (only after a successful, not cancelled install) and closes the window.
+static bool LaunchProgram()
+{
+    if (!g.finished || g.exitCode != 0 || g_cancelled || g.launchPath.empty()) return false;
+    std::wstring dir = g.launchPath;
+    size_t slash = dir.find_last_of(L"\\/");
+    dir = slash == std::wstring::npos ? L"" : dir.substr(0, slash);
+    ShellExecuteW(nullptr, L"open", g.launchPath.c_str(), nullptr, dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL);
+    DestroyWindow(g_hwnd);
+    return true;
+}
+
 static void OnEvent(Event* e)
 {
     switch (e->kind)
@@ -823,6 +838,13 @@ static void OnEvent(Event* e)
         g.title = e->text;
         SetWindowTextW(g_hwnd, (e->text + L" - Setup").c_str());
         break;
+    case Kind::Launch:
+    {
+        size_t bar = e->text.find(L'|');
+        g.launchPath = Trim(e->text.substr(0, bar), L" \t\"");
+        g.launchLabel = bar == std::wstring::npos ? L"" : Trim(e->text.substr(bar + 1));
+        break;
+    }
     case Kind::Progress:
         if (int p = ParsePercent(e->text); p >= 0) g.percent = p;
         break;
@@ -951,6 +973,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         switch (HitTest(lParam, false))
         {
         case BtnAction: if (g.finished) DestroyWindow(hwnd); else RequestCancel(); break;
+        case BtnLaunch: LaunchProgram(); break;
         case BtnDetails: g.details = !g.details; g.logScroll = 0; Relayout(); InvalidateRect(hwnd, nullptr, FALSE); break;
         case BtnYes: AnswerAsk(1); break;
         case BtnNo: AnswerAsk(2); break;
@@ -968,7 +991,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) { if (g.ask) CloseAsk(false); else if (g.finished) DestroyWindow(hwnd); else RequestCancel(); }
-        else if (wParam == VK_RETURN) { if (g.ask) CloseAsk(true); else if (g.finished) DestroyWindow(hwnd); }
+        else if (wParam == VK_RETURN) { if (g.ask) CloseAsk(true); else if (g.finished && !LaunchProgram()) DestroyWindow(hwnd); }
         else if (g.ask && !g.yesNo)
         {
             int number = wParam >= '1' && wParam <= '9' ? (int)(wParam - '0') : wParam >= VK_NUMPAD1 && wParam <= VK_NUMPAD9 ? (int)(wParam - VK_NUMPAD0) : 0;
@@ -1421,7 +1444,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     {
         AttachConsole(ATTACH_PARENT_PROCESS);
         SetEnvironmentVariableW(L"ONESETUP_SHELL", L"headless");
-        const wchar_t* names[] = { L"debug", L"info", L"warn", L"error", L"ask", L"progress", L"title", L"choose" };
+        const wchar_t* names[] = { L"debug", L"info", L"warn", L"error", L"ask", L"progress", L"title", L"choose", L"launch" };
         int headlessCode = RunScript(script, extra,
             [&](Kind k, const std::wstring& t, bool err) { Console(L"[" + std::wstring(err ? L"stderr" : names[(int)k]) + L"] " + t); },
             [&](const std::wstring& t, const std::vector<std::wstring>& options, bool yesNo)
