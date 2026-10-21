@@ -15,6 +15,7 @@
 .\onesetup.exe app -o dist\setup.exe -l 5    # 指定输出文件和压缩等级
 .\onesetup.exe app --ui -o setup.exe        # 带进度界面的安装包（需要 app\install.bat）
 .\onesetup.exe --help                       # 完整用法、安装包行为、界面协议摘要
+.\onesetup.exe --version                    # 显示版本（4.0）
 ```
 
 生成的安装包运行时会解压到临时目录并执行其中的 `install.bat`，结束后删除该目录；`setup.exe -y` 跳过确认提示。`--ui-exe <文件>` 与 `--ui` 相同，但使用自定义的 `onesetup-ui.exe`。

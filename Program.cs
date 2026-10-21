@@ -10,6 +10,12 @@ static class Program
     {
         try
         {
+            if (args.Length == 1 && args[0] is "--version" or "-V")
+            {
+                Console.WriteLine("onesetup " + VersionText);
+                return 0;
+            }
+
             if (args.Length == 0 || IsHelp(args[0]))
             {
                 PrintUsage();
@@ -397,12 +403,22 @@ static class Program
         }
     }
 
+    static string VersionText
+    {
+        get
+        {
+            Version version = typeof(Program).Assembly.GetName().Version ?? new Version(0, 0);
+            return version.Build > 0 ? $"{version.Major}.{version.Minor}.{version.Build}" : $"{version.Major}.{version.Minor}";
+        }
+    }
+
     static bool IsHelp(string argument) => argument is "-h" or "--help" or "/?";
 
     static void PrintUsage()
     {
+        Console.Write("onesetup " + VersionText + " - ");
         Console.WriteLine("""
-            onesetup - pack a directory into a single-file Windows installer
+            pack a directory into a single-file Windows installer
 
             USAGE
               onesetup <dir> [-o <output.exe>] [-l <0-9>] [--icon <file.ico>] [--ui | --ui-exe <file> | --app <program>]
@@ -416,6 +432,7 @@ static class Program
               --ui-exe <file>      like --ui, with a custom onesetup-ui.exe
               --app <program>      single-file app instead of an installer: the first run extracts to a per-user cache,
                                    later runs start <program> (path inside <dir>) straight from the cache
+              -V, --version        show the version
               -h, --help           show this help
 
             EXAMPLES
