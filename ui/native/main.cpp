@@ -100,13 +100,23 @@ static std::atomic<bool> g_cancelled{ false };
 typedef std::function<void(Kind, const std::wstring&, bool)> LineHandler;
 typedef std::function<bool(const std::wstring&)> AskHandler;
 
-static void ReadLines(HANDLE pipe, const std::function<void(const std::wstring&)>& onLine)
+// Reads lines until the script's own process has exited and the pipe is drained. It must not wait for EOF: a program
+// the script starts (for example "start app.exe") inherits the pipe and would keep the installer window open.
+static void ReadLines(HANDLE pipe, HANDLE process, const std::function<void(const std::wstring&)>& onLine)
 {
     std::string pending;
     char buffer[4096];
-    DWORD got;
-    while (ReadFile(pipe, buffer, sizeof buffer, &got, nullptr) && got > 0)
+    for (;;)
     {
+        DWORD available = 0;
+        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) break;
+        if (available == 0)
+        {
+            if (WaitForSingleObject(process, 15) != WAIT_OBJECT_0) continue;
+            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr) || available == 0) break;
+        }
+        DWORD got = 0;
+        if (!ReadFile(pipe, buffer, std::min<DWORD>(available, sizeof buffer), &got, nullptr) || got == 0) break;
         pending.append(buffer, got);
         size_t start = 0, nl;
         while ((nl = pending.find('\n', start)) != std::string::npos)
@@ -145,14 +155,13 @@ static int RunScript(const std::wstring& script, const std::wstring& extra, cons
     CloseHandle(outW); CloseHandle(errW); CloseHandle(inR);
 
     g_job = CreateJobObjectW(nullptr, nullptr);
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &limits, sizeof limits);
+    // No kill-on-close: programs the script launches (e.g. the installed app) must outlive the installer.
+    // The job only exists so Cancel can stop the whole script tree.
     AssignProcessToJobObject(g_job, pi.hProcess);
     ResumeThread(pi.hThread);
 
-    std::thread errors([&] { ReadLines(errR, [&](const std::wstring& line) { onLine(Kind::Debug, line, true); }); });
-    ReadLines(outR, [&](const std::wstring& line)
+    std::thread errors([&] { ReadLines(errR, pi.hProcess, [&](const std::wstring& line) { onLine(Kind::Debug, line, true); }); });
+    ReadLines(outR, pi.hProcess, [&](const std::wstring& line)
     {
         Kind kind; std::wstring text;
         ParseLine(line, kind, text);

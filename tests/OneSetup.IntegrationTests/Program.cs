@@ -110,6 +110,7 @@ static class Program
         await AssertLevelAndProgressAsync(packerPath, sevenZipPath, testRoot, runnerDirectory);
         await AssertUiPackagingAsync(packerPath, sevenZipPath, sourceDirectory, runnerDirectory);
         await AssertFailureExitCodeAsync(packerPath, runnerDirectory, testRoot);
+        await AssertLaunchedProgramSurvivesAsync(packerPath, runnerDirectory, testRoot);
 
         ProcessResult sfxResult = await RunProcessAsync(
             setupPath,
@@ -229,6 +230,31 @@ static class Program
         }
         for (int index = 0; index < expected.Directories.Count; index++)
             Ensure(string.Equals(expected.Directories[index], actual.Directories[index], StringComparison.OrdinalIgnoreCase), $"Directory structure changed: expected '{expected.Directories[index]}', actual '{actual.Directories[index]}'.");
+    }
+
+    // A program started by install.bat ("start app.exe") must outlive the installer, and the UI shell must not wait for it.
+    static async Task AssertLaunchedProgramSurvivesAsync(string packerPath, string runnerDirectory, string testRoot)
+    {
+        string launcher = Path.Combine(testRoot, "launcher");
+        Directory.CreateDirectory(launcher);
+        string marker = Path.Combine(testRoot, "launched.txt");
+        await File.WriteAllTextAsync(Path.Combine(launcher, "install.bat"),
+            "@echo off" + Environment.NewLine +
+            "echo .info Starting the program" + Environment.NewLine +
+            "start \"\" cmd /c \"ping -n 7 127.0.0.1 >nul & echo launched> \"%ONESETUP_TEST_MARKER%\"\"" + Environment.NewLine +
+            "exit /b 0" + Environment.NewLine);
+        string setup = Path.Combine(runnerDirectory, "launcher_setup.exe");
+        ProcessResult pack = await RunProcessAsync(packerPath, [launcher, "-o", setup, "-l", "1", "--ui"], runnerDirectory, timeout: TestTimeout);
+        Ensure(pack.ExitCode == 0, $"Packing failed. {pack.StandardError}");
+        Stopwatch watch = Stopwatch.StartNew();
+        ProcessResult run = await RunProcessAsync(setup, ["-y"], runnerDirectory,
+            new Dictionary<string, string?> { ["ONESETUP_UI"] = "0", ["ONESETUP_TEST_MARKER"] = marker }, TestTimeout);
+        watch.Stop();
+        Ensure(run.ExitCode == 0, $"Installer failed with exit code {run.ExitCode}.");
+        Ensure(watch.Elapsed < TimeSpan.FromSeconds(4.5), $"The installer waited for the program it launched ({watch.Elapsed.TotalSeconds:0.0}s; the program runs 6s).");
+        for (int attempt = 0; attempt < 120 && !File.Exists(marker); attempt++)
+            await Task.Delay(100);
+        Ensure(File.Exists(marker), "The program started by install.bat did not survive the installer.");
     }
 
     // Documents a limitation: the 7zSD module returns 0 even when install.bat fails, so callers must not rely on it.
