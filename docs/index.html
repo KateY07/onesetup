@@ -1,37 +1,321 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OneSetup</title>
-  <style>
-    :root { color-scheme: light dark; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
-    body { margin: 0; background: #f6f7f9; color: #202124; }
-    main { max-width: 760px; margin: 0 auto; padding: 64px 24px; }
-    h1 { margin-bottom: 8px; font-size: 42px; }
-    h2 { margin-top: 36px; }
-    p { line-height: 1.7; }
-    a { color: #0969da; }
-    pre { overflow-x: auto; padding: 16px; border-radius: 8px; background: #1f2328; color: #f0f6fc; }
-    code { font-family: Consolas, "SFMono-Regular", monospace; }
-    .download { display: inline-block; margin: 12px 0; padding: 10px 16px; border-radius: 7px; background: #0969da; color: white; text-decoration: none; }
-    @media (prefers-color-scheme: dark) {
-      body { background: #0d1117; color: #e6edf3; }
-      a { color: #58a6ff; }
-    }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OneSetup · 把一个目录变成单文件安装器</title>
+<meta name="description" content="OneSetup 把任意目录打包成单个 .exe 安装器：7-Zip 压缩、毛玻璃进度窗口、install.bat 协议控制界面。">
+<meta name="theme-color" content="#f5f6fb" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0c12" media="(prefers-color-scheme: dark)">
+<meta property="og:title" content="OneSetup">
+<meta property="og:description" content="One folder. One installer. 把任意目录打包成带界面的单文件安装器。">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<style>
+:root{
+  --bg:#f4f5fb; --ink:#14151a; --muted:#5b6070; --line:rgba(20,21,26,.08);
+  --glass:rgba(255,255,255,.62); --glass-edge:rgba(255,255,255,.75); --shadow:0 18px 50px rgba(40,50,110,.14);
+  --code:#16181f; --code-ink:#e8eaf2; --blue:#0a84ff; --indigo:#5e5ce6; --violet:#bf5af2; --teal:#64d2ff; --green:#30d158; --amber:#ff9f0a; --red:#ff453a;
+  --blob-a:#7aa8ff; --blob-b:#c9a7ff; --blob-c:#ffc4dc;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0b0c12; --ink:#f2f3f8; --muted:#9aa0b4; --line:rgba(255,255,255,.09);
+  --glass:rgba(255,255,255,.07); --glass-edge:rgba(255,255,255,.14); --shadow:0 18px 50px rgba(0,0,0,.45);
+  --code:#0f1118; --blob-a:#1d4fd8; --blob-b:#6d28d9; --blob-c:#be185d;
+}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 "Segoe UI Variable Text","Segoe UI",-apple-system,"PingFang SC","Microsoft YaHei UI","Noto Sans SC",system-ui,sans-serif;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+body::before,body::after{content:"";position:fixed;z-index:-1;border-radius:50%;filter:blur(90px);opacity:.55;pointer-events:none}
+body::before{width:62vmax;height:62vmax;left:-18vmax;top:-22vmax;background:radial-gradient(circle,var(--blob-a),transparent 68%)}
+body::after{width:58vmax;height:58vmax;right:-20vmax;top:18vmax;background:radial-gradient(circle,var(--blob-b),transparent 66%)}
+.blob3{position:fixed;z-index:-1;width:46vmax;height:46vmax;left:20vmax;bottom:-26vmax;border-radius:50%;filter:blur(90px);opacity:.45;background:radial-gradient(circle,var(--blob-c),transparent 66%);pointer-events:none}
+a{color:inherit}
+.wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+.glass{background:var(--glass);border:1px solid var(--glass-edge);backdrop-filter:blur(22px) saturate(160%);-webkit-backdrop-filter:blur(22px) saturate(160%);box-shadow:var(--shadow)}
+nav{position:sticky;top:12px;z-index:20;margin:12px auto 0;max-width:1120px;padding:0 24px}
+nav .bar{display:flex;align-items:center;gap:6px;padding:10px 12px 10px 16px;border-radius:999px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:650;text-decoration:none;margin-right:auto;letter-spacing:.2px}
+.brand img{width:26px;height:26px}
+nav a.link{padding:6px 12px;border-radius:999px;text-decoration:none;color:var(--muted);font-size:14.5px}
+nav a.link:hover{color:var(--ink);background:var(--line)}
+.btn{display:inline-flex;align-items:center;gap:8px;border:0;cursor:pointer;font:inherit;font-weight:600;text-decoration:none;border-radius:999px;padding:11px 22px;color:var(--ink);background:var(--glass);border:1px solid var(--glass-edge);backdrop-filter:blur(14px);transition:transform .15s,box-shadow .15s}
+.btn:hover{transform:translateY(-1px)}
+.btn.primary{color:#fff;border:0;background:linear-gradient(135deg,var(--blue),var(--indigo));box-shadow:0 10px 28px rgba(60,90,230,.38)}
+.btn.primary:hover{box-shadow:0 14px 34px rgba(60,90,230,.5)}
+.btn.small{padding:7px 16px;font-size:14px}
+.lang{cursor:pointer;border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:5px 11px;font:inherit;font-size:13px}
+.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:48px;align-items:center;padding:84px 0 70px}
+.eyebrow{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:999px;font-size:13.5px;color:var(--muted)}
+.eyebrow i{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(48,209,88,.2)}
+h1{font-size:clamp(42px,7vw,78px);line-height:1.04;letter-spacing:-.035em;margin:20px 0 18px;font-weight:700}
+h1 span{background:linear-gradient(100deg,var(--blue),var(--indigo) 45%,var(--violet) 75%,#ff6bb0);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lead{font-size:clamp(17px,2.1vw,20px);color:var(--muted);max-width:34em;margin:0 0 30px}
+.cta{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+.meta{margin-top:18px;font-size:13.5px;color:var(--muted)}
+section{padding:46px 0}
+h2{font-size:clamp(28px,4vw,40px);letter-spacing:-.025em;line-height:1.15;margin:0 0 10px}
+.sub{color:var(--muted);margin:0 0 30px;max-width:40em}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.card{border-radius:22px;padding:24px 24px 22px}
+.card .ico{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;color:#fff;margin-bottom:14px;background:linear-gradient(135deg,var(--blue),var(--indigo))}
+.card:nth-child(2) .ico{background:linear-gradient(135deg,#5e5ce6,var(--violet))}
+.card:nth-child(3) .ico{background:linear-gradient(135deg,#0a84ff,var(--teal))}
+.card:nth-child(4) .ico{background:linear-gradient(135deg,var(--violet),#ff6bb0)}
+.card:nth-child(5) .ico{background:linear-gradient(135deg,#30d158,var(--teal))}
+.card:nth-child(6) .ico{background:linear-gradient(135deg,var(--amber),#ff6b3d)}
+.card h3{margin:0 0 6px;font-size:18px}
+.card p{margin:0;color:var(--muted);font-size:15px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}
+pre{margin:0;padding:20px 22px;border-radius:20px;background:var(--code);color:var(--code-ink);overflow:auto;font:13.5px/1.7 "Cascadia Code",Consolas,"SFMono-Regular",monospace;position:relative}
+pre .c{color:#7d849c}pre .k{color:#7fb4ff}pre .s{color:#ffcf8a}pre .p{color:#c8a2ff}
+.copy{position:absolute;top:10px;right:10px;font-size:12px;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:#cfd3e4;cursor:pointer}
+.tbl{border-radius:20px;overflow:hidden}
+.tbl div{display:grid;grid-template-columns:150px 1fr;gap:12px;padding:12px 18px;border-top:1px solid var(--line);font-size:14.5px}
+.tbl div:first-child{border-top:0}
+.tbl code{font:13px Consolas,monospace;color:var(--indigo)}
+.notes{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.note{border-radius:20px;padding:20px 22px;font-size:14.5px;color:var(--muted)}
+.note b{display:block;color:var(--ink);margin-bottom:4px;font-size:15.5px}
+footer{padding:44px 0 56px;color:var(--muted);font-size:14px;display:flex;flex-wrap:wrap;gap:12px 26px;justify-content:space-between;border-top:1px solid var(--line);margin-top:30px}
+footer a{text-decoration:none}footer a:hover{color:var(--ink)}
+
+/* installer mock */
+.stage{position:relative;border-radius:34px;padding:34px 22px;min-height:470px;display:grid;place-items:center;overflow:hidden;background:linear-gradient(140deg,#bcd6ff,#d9c7ff 50%,#ffd0e2)}
+.stage::before,.stage::after{content:"";position:absolute;border-radius:50%;filter:blur(30px)}
+.stage::before{width:240px;height:240px;left:-60px;bottom:-70px;background:#ffb86b;opacity:.65}
+.stage::after{width:220px;height:220px;right:-50px;top:-50px;background:#5ec8ff;opacity:.6}
+@media (prefers-color-scheme:dark){.stage{background:linear-gradient(140deg,#243a7a,#4b2f8f 55%,#7a2a5a)}}
+.win{position:relative;z-index:1;width:100%;max-width:392px;border-radius:20px;padding:24px 24px 20px;color:#1d1d1f;background:rgba(255,255,255,.58);border:1px solid rgba(255,255,255,.8);backdrop-filter:blur(26px) saturate(170%);-webkit-backdrop-filter:blur(26px) saturate(170%);box-shadow:0 30px 70px rgba(30,40,100,.28)}
+@media (prefers-color-scheme:dark){.win{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.22);color:#f4f5fa}}
+.head{display:flex;gap:14px;align-items:center}
+.badge{position:relative;width:46px;height:46px;border-radius:14px;flex:none;display:grid;place-items:center;background:linear-gradient(135deg,var(--blue),var(--indigo));box-shadow:0 8px 20px rgba(60,90,230,.35);transition:background .5s,transform .5s}
+.badge svg{position:absolute;width:24px;height:24px;fill:none;stroke:#fff;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.badge .chk{stroke-dasharray:30;stroke-dashoffset:30;transition:stroke-dashoffset .5s .25s}
+.badge .dl{transition:opacity .25s}
+.win.done .badge{background:linear-gradient(135deg,#34c759,#30d1b4);transform:scale(1.06)}
+.win.done .badge .chk{stroke-dashoffset:0}.win.done .badge .dl{opacity:0}
+.badge i{position:absolute;left:50%;top:50%;width:7px;height:7px;margin:-3.5px;border-radius:50%;opacity:0}
+.win.done .badge i{animation:burst .95s ease-out .15s}
+@keyframes burst{0%{opacity:1;transform:rotate(var(--a)) translateX(24px) scale(1)}100%{opacity:0;transform:rotate(var(--a)) translateX(62px) scale(.2)}}
+.ttl{font-weight:650;font-size:18px;line-height:1.2}
+.st{font-size:13px;opacity:.65;transition:color .3s}
+.win.done .st{color:#1f9d4a;opacity:1}
+.pct{margin-left:auto;font-size:26px;font-weight:300;background:linear-gradient(90deg,var(--blue),var(--indigo));-webkit-background-clip:text;background-clip:text;color:transparent;font-variant-numeric:tabular-nums}
+.win.done .pct{opacity:0}
+.list{margin:18px 0 0;padding:8px;border-radius:14px;background:rgba(255,255,255,.4);border:1px solid rgba(255,255,255,.6);height:146px;list-style:none;overflow:hidden}
+@media (prefers-color-scheme:dark){.list{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.14)}}
+.list li{display:flex;align-items:center;gap:11px;height:32px;padding:0 10px;border-radius:9px;font-size:14px;opacity:0;transform:translateY(6px);transition:opacity .35s,transform .35s,background .3s}
+.list li.show{opacity:1;transform:none}
+.list li.on{background:linear-gradient(90deg,rgba(10,132,255,.16),rgba(191,90,242,.08))}
+.list li .d{width:18px;height:18px;border-radius:50%;flex:none;display:grid;place-items:center;font-size:11px;color:#fff;background:#30d158}
+.list li.on .d{background:none;border:2px solid rgba(10,132,255,.2);border-top-color:var(--blue);animation:spin .8s linear infinite}
+.list li.on .d::after,.list li:not(.on) .d::after{content:""}
+.list li:not(.on) .d::after{width:8px;height:4px;border-left:2px solid #fff;border-bottom:2px solid #fff;transform:rotate(-45deg) translate(1px,-1px)}
+.list li:not(.on){opacity:.72}
+@keyframes spin{to{transform:rotate(360deg)}}
+.track{height:8px;border-radius:4px;background:rgba(0,0,0,.09);margin-top:16px;overflow:hidden}
+@media (prefers-color-scheme:dark){.track{background:rgba(255,255,255,.14)}}
+.fill{height:100%;width:0;border-radius:4px;background:linear-gradient(90deg,var(--blue),var(--indigo) 55%,var(--violet));transition:width .6s cubic-bezier(.2,.8,.2,1),background .6s}
+.win.done .fill{background:linear-gradient(90deg,#34c759,#64d2ff)}
+.tick{height:18px;margin-top:8px;font:12px/18px Consolas,monospace;opacity:.6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.foot{display:flex;justify-content:space-between;align-items:center;margin-top:10px;font-size:13px}
+.foot span{opacity:.6}
+.pill{padding:8px 22px;border-radius:999px;font-size:13px;font-weight:600;background:rgba(120,120,128,.16);transition:background .4s,color .4s}
+.win.done .pill{background:linear-gradient(135deg,var(--blue),var(--indigo));color:#fff}
+
+@media (max-width:900px){
+  .hero{grid-template-columns:1fr;padding:56px 0 40px;gap:36px}
+  .grid,.notes{grid-template-columns:1fr 1fr}.two{grid-template-columns:1fr}
+  nav a.link{display:none}
+}
+@media (max-width:600px){
+  .wrap,nav{padding:0 16px}.grid,.notes{grid-template-columns:1fr}.stage{min-height:430px;padding:24px 12px}
+  .tbl div{grid-template-columns:1fr;gap:2px}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}html{scroll-behavior:auto}}
+</style>
 </head>
 <body>
-  <main>
-    <h1>OneSetup</h1>
-    <p>把一个目录打包成单文件安装器。运行生成的 <code>.exe</code> 时，它会自动解压到临时目录，并执行根目录中的 <code>install.bat</code>（如果存在）。</p>
+<div class="blob3"></div>
+<nav><div class="bar glass">
+  <a class="brand" href="#top"><img src="favicon.svg" alt="">OneSetup</a>
+  <a class="link" href="#features" data-en="Features">特性</a>
+  <a class="link" href="#start" data-en="Quick start">快速开始</a>
+  <a class="link" href="#protocol" data-en="UI protocol">界面协议</a>
+  <a class="link" href="https://github.com/KateY07/onesetup">GitHub</a>
+  <button class="lang" id="lang" aria-label="Language">EN</button>
+  <a class="btn primary small dl" href="https://github.com/KateY07/onesetup/releases" data-en="Download">下载</a>
+</div></nav>
 
-    <a class="download" href="https://github.com/KateY07/onesetup/releases/download/v3.pre11/onesetup.exe">下载 onesetup.exe</a>
+<main class="wrap" id="top">
+  <div class="hero">
+    <div>
+      <span class="eyebrow glass"><i></i><span id="ver">v3.pre11</span> · Windows · <span data-en="single file">单文件</span></span>
+      <h1><span data-en="One folder.">一个目录，</span><br><span data-en="One installer." style="background-image:linear-gradient(100deg,var(--violet),#ff6bb0)">一个安装器。</span></h1>
+      <p class="lead" data-en="Pack any folder into a single .exe that extracts itself and runs your install.bat — with a frosted-glass progress window, a rolling log and a finish animation. No runtime to install.">把任意目录打包成单个 .exe：自解压、运行你的 install.bat，并配有毛玻璃进度窗口、滚动日志和完成动画。目标机无需安装任何运行时。</p>
+      <div class="cta">
+        <a class="btn primary" id="download" href="https://github.com/KateY07/onesetup/releases/latest"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="M7 11l5 5 5-5"/><path d="M5 20h14"/></svg><span data-en="Download onesetup.exe">下载 onesetup.exe</span></a>
+        <a class="btn" href="https://github.com/KateY07/onesetup" data-en="View on GitHub">在 GitHub 查看</a>
+      </div>
+      <p class="meta" id="meta" data-en="Includes 7-Zip and the UI shell · Windows 10 / 11 · x64">内含 7-Zip 与界面外壳 · Windows 10 / 11 · x64</p>
+    </div>
 
-    <h2>使用</h2>
-    <pre><code>.onesetup.exe &lt;目录路径&gt; [-o &lt;输出文件&gt;] [-l &lt;0-9&gt;]</code></pre>
-    <p>不指定 <code>-o</code> 时，输出文件默认为 <code>&lt;目录名&gt;_setup.exe</code>。</p>
+    <div class="stage" aria-label="Installer preview" role="img">
+      <div class="win" id="win">
+        <div class="head">
+          <div class="badge"><svg class="dl" viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7.5 11 12 15.5 16.5 11"/><path d="M5 20h14"/></svg><svg class="chk" viewBox="0 0 24 24"><path d="M5 12.5 10 17.5 19 7"/></svg><i style="--a:0deg;background:#0a84ff"></i><i style="--a:45deg;background:#bf5af2"></i><i style="--a:90deg;background:#ff9f0a"></i><i style="--a:135deg;background:#30d158"></i><i style="--a:180deg;background:#ff375f"></i><i style="--a:225deg;background:#64d2ff"></i><i style="--a:270deg;background:#ffd60a"></i><i style="--a:315deg;background:#5e5ce6"></i></div>
+          <div><div class="ttl">Demo Application</div><div class="st" id="st">Preparing…</div></div>
+          <div class="pct" id="pct">0%</div>
+        </div>
+        <ul class="list" id="list"></ul>
+        <div class="track"><div class="fill" id="fill"></div></div>
+        <div class="tick" id="tick"></div>
+        <div class="foot"><span data-en="Details">详情</span><div class="pill" id="pill">Cancel</div></div>
+      </div>
+    </div>
+  </div>
 
-  </main>
+  <section id="features">
+    <h2 data-en="Small tool, finished feel">小工具，成品感</h2>
+    <p class="sub" data-en="Everything an installer needs, nothing you have to ship alongside it." >安装器该有的都有，而且不需要你另外带任何东西。</p>
+    <div class="grid">
+      <div class="card glass"><div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg></div><h3 data-en="One file out">单文件输出</h3><p data-en="The package extracts to a temp folder, runs install.bat there, then cleans up after itself.">安装包解压到临时目录，在其中运行 install.bat，结束后自行清理。</p></div>
+      <div class="card glass"><div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h10M4 17h6"/></svg></div><h3 data-en="7-Zip compression">7-Zip 压缩</h3><p data-en="LZMA2 with -l 0–9: store for already-compressed data, 9 for the smallest installer.">LZMA2，-l 0–9 可调：已压缩的数据用 0，要最小体积用 9。</p></div>
+      <div class="card glass"><div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="3"/><path d="M8 21h8"/></svg></div><h3 data-en="Native UI shell">原生界面外壳</h3><p data-en="--ui adds a ~220 KB Win32 + Direct2D window with Acrylic glass. No .NET to install on the target.">--ui 附带约 220 KB 的 Win32 + Direct2D 窗口，Acrylic 毛玻璃，目标机无需 .NET。</p></div>
+      <div class="card glass"><div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M14 5l-4 14"/></svg></div><h3 data-en="Scripted by stdout">用输出控制界面</h3><p data-en="Your install.bat just echoes “.info”, “.progress”, “.ask” lines. No SDK, no API.">install.bat 里 echo 一行 .info、.progress、.ask 即可，没有 SDK，没有 API。</p></div>
+      <div class="card glass"><div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-10"/></svg></div><h3 data-en="Launch survives">启动的程序不受牵连</h3><p data-en="An app started with “start” keeps running after the installer closes, and the window never waits for it.">用 start 启动的应用在安装窗口关闭后继续运行，窗口也不会等它。</p></div>
+      <div class="card glass"><div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg></div><h3 data-en="Source only, built fresh">仓库只含源码</h3><p data-en="The UI shell is compiled from ui/native with MSVC on every build and embedded. No binary blobs in git.">界面外壳在每次构建时由 ui/native 用 MSVC 编译并内嵌，仓库里没有二进制。</p></div>
+    </div>
+  </section>
+
+  <section id="start">
+    <h2 data-en="Quick start">快速开始</h2>
+    <p class="sub" data-en="Download onesetup.exe, point it at a folder, ship the result.">下载 onesetup.exe，指向一个目录，把生成的文件发出去。</p>
+    <div class="two">
+      <pre><button class="copy" data-copy="onesetup app -o setup.exe --ui">copy</button><span class="c"># pack ./app → setup.exe</span>
+<span class="k">onesetup</span> app -o setup.exe
+
+<span class="c"># with the progress window</span>
+<span class="k">onesetup</span> app <span class="p">--ui</span> -o setup.exe
+
+<span class="c"># smaller / faster (0 = store, 9 = smallest)</span>
+<span class="k">onesetup</span> app <span class="p">-l</span> 5
+
+<span class="c"># silent run of the result</span>
+<span class="k">setup.exe</span> -y</pre>
+      <div class="tbl glass">
+        <div><code>-o, --output</code><span data-en="Output file. Default: &amp;lt;dir&amp;gt;_setup.exe. Never overwrites.">输出文件，默认 &lt;目录&gt;_setup.exe，不会覆盖已有文件。</span></div>
+        <div><code>-l, --level</code><span data-en="Compression 0–9, default 9.">压缩等级 0–9，默认 9。</span></div>
+        <div><code>--ui</code><span data-en="Run install.bat through the built-in UI shell (needs install.bat).">通过内置界面外壳运行 install.bat（需要 install.bat）。</span></div>
+        <div><code>--ui-exe</code><span data-en="Same, with your own onesetup-ui.exe.">同上，使用自定义的 onesetup-ui.exe。</span></div>
+        <div><code>-h, --help</code><span data-en="Full usage, examples and exit codes.">完整用法、示例与退出码。</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="protocol">
+    <h2 data-en="Your script drives the window">让脚本驱动窗口</h2>
+    <p class="sub" data-en="Lines starting with a dot are commands; everything else lands in the Details log.">以点开头的行是指令，其余输出进入“详情”日志。</p>
+    <div class="two">
+      <pre><button class="copy" data-copy=".title My App">copy</button><span class="k">@echo off</span>
+<span class="k">echo</span> .title My App
+<span class="k">echo</span> .info Copying files
+<span class="k">echo</span> .progress 40
+<span class="k">xcopy</span> /E /I app "%LOCALAPPDATA%\MyApp" <span class="c">&gt;nul</span>
+
+<span class="k">echo</span> .ask Launch My App now?
+<span class="k">set</span> /p ANS=
+<span class="k">if</span> /i "%ANS%"=="yes" <span class="k">start</span> "" "%LOCALAPPDATA%\MyApp\app.exe"
+
+<span class="k">echo</span> .progress 100
+<span class="k">echo</span> .info Done</pre>
+      <div class="tbl glass">
+        <div><code>.title</code><span data-en="Window heading">窗口标题</span></div>
+        <div><code>.info</code><span data-en="New step in the checklist">清单里的新步骤</span></div>
+        <div><code>.warn / .error</code><span data-en="Amber / red row">琥珀色 / 红色条目</span></div>
+        <div><code>.progress 0-100</code><span data-en="Progress bar">进度条</span></div>
+        <div><code>.ask</code><span data-en="Yes/No sheet; the answer arrives on stdin">是/否抽屉，答案从 stdin 传回</span></div>
+        <div><code>(other)</code><span data-en="Kept in the Details log">进入“详情”日志</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2 data-en="Good to know">须知</h2>
+    <p class="sub" data-en="Honest edges, so nothing surprises you in production.">把边界说清楚，免得上线时意外。</p>
+    <div class="notes">
+      <div class="note glass"><b data-en="Exit code is always 0">安装包退出码恒为 0</b><span data-en="The 7zSD module does not pass install.bat's exit code on. The window shows failures; for automation have install.bat write a log or marker file.">7zSD 模块不传递 install.bat 的退出码。窗口会显示失败；自动化场景请让 install.bat 自己写日志或标记文件。</span></div>
+      <div class="note glass"><b data-en="Keep install.bat ASCII">install.bat 保持 ASCII</b><span data-en="cmd can cut a UTF-8 line that crosses its 512-byte read block. Put localized text in a UTF-8 file and print it with “type”.">cmd 可能截断跨过 512 字节读取块的 UTF-8 行。把本地化文字放进 UTF-8 文件，用 type 输出。</span></div>
+      <div class="note glass"><b data-en="Glass needs a modern Windows">毛玻璃需要较新的 Windows</b><span data-en="Acrylic works on current Windows 10 / 11; if unavailable the window falls back to a clean white card.">当前版本的 Windows 10 / 11 支持 Acrylic；不可用时自动回退为白色卡片。</span></div>
+    </div>
+  </section>
+
+  <footer>
+    <span>OneSetup · <span data-en="Pack a folder, ship one file.">打包一个目录，发布一个文件。</span></span>
+    <span><a href="https://github.com/KateY07/onesetup">GitHub</a> · <a href="https://github.com/KateY07/onesetup/releases">Releases</a> · <a href="https://github.com/KateY07/onesetup/blob/main/README.md">README</a> · <a href="https://github.com/KateY07/onesetup/blob/main/ui/README.md">UI protocol</a> · <a href="https://github.com/KateY07/onesetup/blob/main/THIRD-PARTY-NOTICES.md">7-Zip</a></span>
+  </footer>
+</main>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id)};
+  var en=false, store; try{store=window.localStorage}catch(e){}
+  var nodes=[].slice.call(document.querySelectorAll('[data-en]'));
+  nodes.forEach(function(n){n.setAttribute('data-zh',n.innerHTML)});
+  function setLang(v){
+    en=v; document.documentElement.lang=en?'en':'zh-CN';
+    nodes.forEach(function(n){n.innerHTML=en?n.getAttribute('data-en'):n.getAttribute('data-zh')});
+    $('lang').textContent=en?'中文':'EN';
+    document.title=en?'OneSetup · Turn a folder into a single-file installer':'OneSetup · 把一个目录变成单文件安装器';
+    try{store&&store.setItem('lang',en?'en':'zh')}catch(e){}
+    steps=en?stepsEn:stepsZh; if(!running)reset(true);
+  }
+  $('lang').onclick=function(){setLang(!en)};
+
+  fetch('https://api.github.com/repos/KateY07/onesetup/releases?per_page=1').then(function(r){return r.json()}).then(function(rs){
+    var r=rs&&rs[0], a=r&&r.assets&&r.assets.filter(function(x){return /onesetup\.exe$/.test(x.name)})[0];
+    if(!a)return; $('download').href=a.browser_download_url; $('ver').textContent=r.tag_name;
+    var mb=(a.size/1048576).toFixed(0); var m=$('meta');
+    m.setAttribute('data-zh','onesetup.exe · '+mb+' MB · 内含 7-Zip 与界面外壳 · Windows 10 / 11 · x64');
+    m.setAttribute('data-en','onesetup.exe · '+mb+' MB · includes 7-Zip and the UI shell · Windows 10 / 11 · x64');
+    m.innerHTML=en?m.getAttribute('data-en'):m.getAttribute('data-zh');
+  }).catch(function(){});
+
+  [].forEach.call(document.querySelectorAll('.copy'),function(b){b.onclick=function(){
+    var pre=b.parentNode, t=pre.textContent.replace(/^copy/,'');
+    (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){b.textContent='✓'}).catch(function(){b.textContent='–'});
+    setTimeout(function(){b.textContent='copy'},1400)}});
+
+  // installer demo
+  var stepsZh=['检查环境','复制文件','写入配置','创建快捷方式'], stepsEn=['Checking environment','Copying files','Writing configuration','Creating shortcuts'];
+  var steps=stepsZh, logs=['checking disk space ...','copying part 20 ...','writing app.json','shortcut created'];
+  var win=$('win'), list=$('list'), running=false, token=0, timers=[];
+  function later(ms,fn){timers.push(setTimeout(fn,ms))}
+  function setPct(p){ $('fill').style.width=p+'%'; $('pct').textContent=Math.round(p)+'%'; }
+  function reset(quiet){
+    timers.forEach(clearTimeout); timers=[]; win.classList.remove('done'); list.innerHTML='';
+    $('st').textContent=en?'Preparing…':'准备中…'; $('pill').textContent=en?'Cancel':'取消'; $('tick').textContent=''; setPct(0);
+    if(quiet){steps.forEach(function(s,i){var li=document.createElement('li');li.className='show'+(i==steps.length-1?' on':'');li.innerHTML='<span class="d"></span>'+s;list.appendChild(li)});setPct(72);$('st').textContent=(en?'Step ':'第 ')+steps.length+(en?'':' 步')}
+  }
+  function play(){
+    running=true; reset(false); var my=++token;
+    steps.forEach(function(s,i){
+      later(700+i*1500,function(){
+        if(my!==token)return; var prev=list.querySelector('.on'); if(prev)prev.classList.remove('on');
+        var li=document.createElement('li'); li.className='on'; li.innerHTML='<span class="d"></span>'+s; list.appendChild(li);
+        requestAnimationFrame(function(){li.classList.add('show')});
+        setPct((i+1)/steps.length*94); $('st').textContent=(en?'Step ':'第 ')+(i+1)+(en?'':' 步'); $('tick').textContent='› '+logs[i];
+      });
+    });
+    var end=700+steps.length*1500+600;
+    later(end,function(){ var on=list.querySelector('.on'); if(on)on.classList.remove('on'); setPct(100); win.classList.add('done'); $('st').textContent=en?'Installation complete':'安装完成'; $('pill').textContent=en?'Close':'关闭'; $('tick').textContent='› done'; });
+    later(end+4200,function(){ if(my===token)play() });
+  }
+  var reduce=window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var saved; try{saved=store&&store.getItem('lang')}catch(e){}
+  setLang(saved?saved==='en':!/^zh/i.test(navigator.language||'zh'));
+  if(reduce){running=false;reset(true);win.classList.add('done');$('st').textContent=en?'Installation complete':'安装完成';setPct(100)} else play();
+})();
+</script>
 </body>
 </html>
