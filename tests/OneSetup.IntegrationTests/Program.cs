@@ -97,6 +97,7 @@ static class Program
             runnerDirectory,
             timeout: TestTimeout);
         Ensure(extractResult.ExitCode == 0, $"7-Zip could not extract the generated SFX.\nSTDOUT:\n{extractResult.StandardOutput}\nSTDERR:\n{extractResult.StandardError}");
+        File.Delete(Path.Combine(extractedDirectory, "onesetup-ui.exe"));   // the shell that runs install.bat travels with the payload
         AssertManifestEqual(expectedManifest, CaptureManifest(extractedDirectory));
 
         ProcessResult collisionResult = await RunProcessAsync(
@@ -143,7 +144,7 @@ static class Program
     static void AssertSfxConfiguration(string setupPath)
     {
         string packageText = Encoding.UTF8.GetString(File.ReadAllBytes(setupPath));
-        Ensure(packageText.Contains("ExecuteFile=\"install.bat\"", StringComparison.Ordinal), "The generated SFX does not execute install.bat directly.");
+        Ensure(packageText.Contains("ExecuteFile=\"onesetup-ui.exe\"", StringComparison.Ordinal) && packageText.Contains("ExecuteParameters=\"--plain install.bat\"", StringComparison.Ordinal), "The generated SFX does not run install.bat through the shell.");
         Ensure(!packageText.Contains("RunProgram=\"cmd.exe", StringComparison.Ordinal), "The generated SFX still uses the broken RunProgram cmd.exe path.");
     }
 
@@ -171,7 +172,7 @@ static class Program
             Ensure(actual.TryGetValue(name, out string? actualValue), $"Environment variable was missing: {name}");
             Ensure(string.Equals(value, actualValue, StringComparison.Ordinal), $"Environment variable changed: {name}");
         }
-        foreach (string name in actual.Keys)
+        foreach (string name in actual.Keys.Where(name => !name.Equals("ONESETUP_RESULT", StringComparison.OrdinalIgnoreCase)))   // set by the setup.exe stub
             Ensure(expected.ContainsKey(name), $"Unexpected environment variable: {name}");
     }
 
@@ -257,7 +258,7 @@ static class Program
         Ensure(File.Exists(marker), "The program started by install.bat did not survive the installer.");
     }
 
-    // Documents a limitation: the 7zSD module returns 0 even when install.bat fails, so callers must not rely on it.
+    // install.bat's exit code must reach the caller of setup.exe (the 7zSD module alone always returns 0).
     static async Task AssertFailureExitCodeAsync(string packerPath, string runnerDirectory, string testRoot)
     {
         string failing = Path.Combine(testRoot, "failing");
@@ -269,7 +270,13 @@ static class Program
         Ensure(pack.ExitCode == 0, $"Packing failed. {pack.StandardError}");
         ProcessResult run = await RunProcessAsync(setup, ["-y"], runnerDirectory, new Dictionary<string, string?> { ["ONESETUP_TEST_MARKER"] = marker }, TestTimeout);
         Ensure(File.Exists(marker), "The failing install.bat did not run.");
-        Ensure(run.ExitCode == 0, $"7zSD now propagates install.bat's exit code ({run.ExitCode}); update the docs and this test.");
+        Ensure(run.ExitCode == 3, $"setup.exe did not return install.bat's exit code 3 (got {run.ExitCode}).");
+
+        string uiSetup = Path.Combine(runnerDirectory, "failing_ui_setup.exe");
+        ProcessResult uiPack = await RunProcessAsync(packerPath, [failing, "-o", uiSetup, "-l", "1", "--ui"], runnerDirectory, timeout: TestTimeout);
+        Ensure(uiPack.ExitCode == 0, $"Packing with --ui failed. {uiPack.StandardError}");
+        ProcessResult uiRun = await RunProcessAsync(uiSetup, ["-y"], runnerDirectory, new Dictionary<string, string?> { ["ONESETUP_TEST_MARKER"] = marker, ["ONESETUP_UI"] = "0" }, TestTimeout);
+        Ensure(uiRun.ExitCode == 3, $"The --ui setup.exe did not return install.bat's exit code 3 (got {uiRun.ExitCode}).");
     }
 
     static async Task AssertUiPackagingAsync(string packerPath, string sevenZipPath, string sourceDirectory, string runnerDirectory)

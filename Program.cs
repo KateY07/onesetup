@@ -109,18 +109,19 @@ static class Program
                 throw new InvalidOperationException("--ui needs an install.bat in the source directory.");
 
             await Create7zArchiveAsync(sevenZipPath, sourceDirectory, archivePath, level);
-            if (useUi)
-            {
-                if (uiPath is null)
-                    await WriteEmbeddedResourceAsync("OneSetup.ui.exe", Path.Combine(temporaryDirectory, UiFileName));
-                else
-                    File.Copy(uiPath, Path.Combine(temporaryDirectory, UiFileName));
+            string shellPath = Path.Combine(temporaryDirectory, UiFileName);
+            if (uiPath is null)
+                await WriteEmbeddedResourceAsync("OneSetup.ui.exe", shellPath);
+            else
+                File.Copy(uiPath, shellPath);
+            if (hasInstallScript)
                 await Create7zArchiveAsync(sevenZipPath, temporaryDirectory, archivePath, level, UiFileName);
-            }
 
             await WriteSfxConfigAsync(configPath, hasInstallScript, useUi);
             await WriteEmbeddedResourceAsync("OneSetup.7zSD.sfx", sfxModulePath);
-            await ConcatenateAsync(temporaryOutput, sfxModulePath, configPath, archivePath);
+            string innerPath = Path.Combine(temporaryDirectory, "inner.exe");
+            await ConcatenateAsync(innerPath, sfxModulePath, configPath, archivePath);
+            await AssembleInstallerAsync(temporaryOutput, shellPath, innerPath);
 
             string? outputDirectory = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(outputDirectory))
@@ -184,15 +185,26 @@ static class Program
         config.AppendLine(";!@Install@!UTF-8!");
         config.AppendLine("Title=\"OneSetup\"");
         config.AppendLine("Progress=\"yes\"");
-        if (useUi)
+        if (hasInstallScript)
         {
+            // The shell runs install.bat (with its window, or in a plain console with --plain) and records its exit code.
             config.AppendLine("ExecuteFile=\"onesetup-ui.exe\"");
-            config.AppendLine("ExecuteParameters=\"install.bat\"");
+            config.AppendLine(useUi ? "ExecuteParameters=\"install.bat\"" : "ExecuteParameters=\"--plain install.bat\"");
         }
-        else if (hasInstallScript)
-            config.AppendLine("ExecuteFile=\"install.bat\"");
         config.AppendLine(";!@InstallEnd@!");
         await File.WriteAllTextAsync(configPath, config.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+    }
+
+    // setup.exe = [onesetup-ui.exe in stub mode][inner 7zSD installer][8-byte offset + "ONESETUP"].
+    // 7zSD always exits 0, so the stub runs the inner installer, reads install.bat's exit code from the file named by
+    // ONESETUP_RESULT and returns it as the exit code of setup.exe.
+    static async Task AssembleInstallerAsync(string outputPath, string shellPath, string innerPath)
+    {
+        long offset = new FileInfo(shellPath).Length;
+        await ConcatenateAsync(outputPath, shellPath, innerPath);
+        await using FileStream output = new(outputPath, FileMode.Append, FileAccess.Write);
+        await output.WriteAsync(BitConverter.GetBytes(offset));
+        await output.WriteAsync(Encoding.ASCII.GetBytes("ONESETUP"));
     }
 
     static async Task WriteEmbeddedResourceAsync(string resourceName, string outputPath)
@@ -325,9 +337,9 @@ static class Program
 
             EXIT CODES
               onesetup: 0 success, 1 error, 2 no arguments.
-              Generated installer: always 0. The 7zSD module does not pass install.bat's exit code on, so automation cannot
-              detect a failed install from it; have install.bat write its own log or marker file. The UI window does show
-              failures (red badge, log opened).
+              Generated installer: install.bat's exit code (the 7zSD module alone always returns 0; a small stub in front
+              of it collects the real code). With --ui, cancelling in the window returns 2. If the installer cannot even
+              start or extract, the code is non-zero.
             """);
     }
 }

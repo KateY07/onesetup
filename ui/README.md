@@ -28,9 +28,8 @@ or `choice` unguarded: `if not defined ONESETUP_SHELL pause`.
 Programs the script starts (`start "" "%TARGET%\app.exe"`) keep running after the installer closes; the shell does not
 wait for them or stop them. Only Cancel stops the script and everything it started so far.
 
-The generated installer always exits 0 (the 7zSD module does not pass the script's exit code on); the shell itself
-returns the script's exit code (2 = cancelled) but the SFX discards it. Automation should rely on a log or marker file
-written by `install.bat`.
+The generated setup.exe returns install.bat's exit code (a small stub in front of the 7zSD module collects it, because
+7zSD itself always exits 0). Cancelling in the window returns 2; a failure to extract or start returns non-zero.
 
 Exit code = install.bat exit code (2 = cancelled). Flags: `--headless` (no window, lines printed as `[kind] text`;
 also `ONESETUP_UI=0`; `.ask` answers from `ONESETUP_ASK`, default yes), `--auto-close`, `--no-glass`.

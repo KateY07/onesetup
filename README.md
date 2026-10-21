@@ -39,3 +39,17 @@ dotnet run --project .\tests\OneSetup.IntegrationTests -- .\publish\onesetup.exe
 dotnet publish -c Release -p:OneSetupUiExe=D:\path\to\onesetup-ui.exe
 ```
 
+## 退出码
+
+生成的安装包会返回 `install.bat` 的退出码（7zSD 模块本身恒返回 0，所以在它前面加了一个很小的外壳来收集真实退出码）。`--ui` 时在窗口里点“取消”返回 2；解压或启动失败返回非 0。`onesetup` 自身：0 成功，1 出错，2 缺少参数。
+
+## 安装 OneSetup 本身
+
+OneSetup 用自己打包了自己：从 [Releases](https://github.com/KateY07/onesetup/releases) 下载 `onesetup-setup.exe`，运行后会把 `onesetup.exe` 复制到 `%LOCALAPPDATA%\OneSetup` 并加入当前用户的 PATH（不需要管理员权限），然后提供一段无害的幽默演示（可以拒绝；设置环境变量 `ONESETUP_UNATTENDED=1` 可跳过提问和演示）。
+
+自己构建安装包：
+
+```powershell
+.\installer\build-installer.ps1      # 生成 dist\onesetup-setup.exe 及其 SHA-256
+```
+

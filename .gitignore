@@ -5,3 +5,4 @@ publish/
 ui/publish/
 vendor/onesetup-ui.exe
 obj/
+dist/

@@ -989,11 +989,142 @@ static void Console(const std::wstring& text)
     WriteFile(out, s.data(), (DWORD)s.size(), &written, nullptr);
 }
 
+// ---------------------------------------------------------------- exit code plumbing
+// The 7zSD module always exits 0. A packaged setup.exe is therefore [this exe][inner 7zSD installer][offset + "ONESETUP"]:
+// started that way, this exe runs the inner installer, which runs `onesetup-ui.exe <script>` in the extraction folder; the
+// shell writes the script's exit code to the file named by ONESETUP_RESULT, and the outer exe returns that code.
+struct StubFooter { unsigned long long offset; char magic[8]; };
+
+static void WriteResult(int code)
+{
+    wchar_t path[MAX_PATH * 2];
+    DWORD n = GetEnvironmentVariableW(L"ONESETUP_RESULT", path, (DWORD)std::size(path));
+    if (n == 0 || n >= std::size(path)) return;
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    std::string text = std::to_string(code);
+    DWORD written;
+    WriteFile(f, text.data(), (DWORD)text.size(), &written, nullptr);
+    CloseHandle(f);
+}
+
+static std::wstring ArgumentsAfterProgram()
+{
+    const wchar_t* p = GetCommandLineW();
+    if (*p == L'"') { ++p; while (*p && *p != L'"') ++p; if (*p) ++p; }
+    else while (*p && *p != L' ' && *p != L'\t') ++p;
+    while (*p == L' ' || *p == L'\t') ++p;
+    return p;
+}
+
+static bool RunAsStub(int& exitCode)
+{
+    wchar_t self[MAX_PATH * 2];
+    GetModuleFileNameW(nullptr, self, (DWORD)std::size(self));
+    HANDLE file = CreateFileW(self, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{}, at{};
+    StubFooter footer{};
+    DWORD got = 0;
+    bool ok = GetFileSizeEx(file, &size) && size.QuadPart > (LONGLONG)sizeof footer;
+    if (ok)
+    {
+        at.QuadPart = size.QuadPart - (LONGLONG)sizeof footer;
+        ok = SetFilePointerEx(file, at, nullptr, FILE_BEGIN) && ReadFile(file, &footer, sizeof footer, &got, nullptr) && got == sizeof footer &&
+            memcmp(footer.magic, "ONESETUP", 8) == 0 && (LONGLONG)footer.offset < at.QuadPart;
+    }
+    if (!ok) { CloseHandle(file); return false; }
+
+    wchar_t temp[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp);
+    std::wstring dir = std::wstring(temp) + L"onesetup-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring inner = dir + L"\\setup.exe", result = dir + L"\\result.txt";
+    auto cleanup = [&]
+    {
+        for (int i = 0; i < 30; i++)
+        {
+            DeleteFileW(inner.c_str());
+            DeleteFileW(result.c_str());
+            if (RemoveDirectoryW(dir.c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) break;
+            Sleep(100);
+        }
+    };
+
+    exitCode = 1;
+    HANDLE out = CreateFileW(inner.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    LARGE_INTEGER from{};
+    from.QuadPart = (LONGLONG)footer.offset;
+    if (out == INVALID_HANDLE_VALUE || !SetFilePointerEx(file, from, nullptr, FILE_BEGIN))
+    {
+        if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+        CloseHandle(file);
+        cleanup();
+        return true;
+    }
+    LONGLONG remaining = at.QuadPart - (LONGLONG)footer.offset;
+    std::vector<char> buffer(1 << 20);
+    while (remaining > 0)
+    {
+        DWORD want = (DWORD)std::min<LONGLONG>(remaining, (LONGLONG)buffer.size()), wrote = 0;
+        if (!ReadFile(file, buffer.data(), want, &got, nullptr) || got == 0 || !WriteFile(out, buffer.data(), got, &wrote, nullptr)) break;
+        remaining -= got;
+    }
+    CloseHandle(out);
+    CloseHandle(file);
+    if (remaining > 0) { cleanup(); return true; }
+
+    SetEnvironmentVariableW(L"ONESETUP_RESULT", result.c_str());
+    std::wstring command = L"\"" + inner + L"\" " + ArgumentsAfterProgram();
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi)) { cleanup(); return true; }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD innerCode = 1;
+    GetExitCodeProcess(pi.hProcess, &innerCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    exitCode = (int)innerCode;   // extraction failed or was cancelled: no result file, keep the module's own code
+    HANDLE r = CreateFileW(result.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (r != INVALID_HANDLE_VALUE)
+    {
+        char text[32] = {};
+        DWORD n = 0;
+        if (ReadFile(r, text, sizeof text - 1, &n, nullptr) && n > 0) exitCode = atoi(text);
+        CloseHandle(r);
+    }
+    cleanup();
+    return true;
+}
+
+// `onesetup-ui.exe --plain install.bat`: run the script in an ordinary console window, as the SFX used to.
+static int RunPlain(const std::wstring& script, const std::wstring& extra)
+{
+    std::wstring command = L"cmd.exe /d /c call \"" + script + L"\" " + extra;
+    std::wstring dir = script.substr(0, script.find_last_of(L"\\/"));
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr, dir.c_str(), &si, &pi)) return 1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)code;
+}
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
+    {
+        int stubCode = 0;
+        if (RunAsStub(stubCode)) return stubCode;
+    }
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    bool headless = false, noGlass = false;
+    bool headless = false, noGlass = false, plain = false;
     std::vector<std::wstring> rest;
     for (int i = 1; i < argc; i++)
     {
@@ -1001,6 +1132,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         if (a == L"--headless") headless = true;
         else if (a == L"--auto-close") g_autoClose = true;
         else if (a == L"--no-glass") noGlass = true;
+        else if (a == L"--plain") plain = true;
         else rest.push_back(a);
     }
     wchar_t env[8];
@@ -1023,12 +1155,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     size_t slash = script.find_last_of(L"\\/"), dot = script.find_last_of(L'.');
     g.scriptName = script.substr(slash + 1, (dot > slash ? dot : script.size()) - slash - 1);
 
+    if (plain)
+    {
+        int code = RunPlain(script, extra);
+        WriteResult(code);
+        return code;
+    }
+
     if (headless)
     {
         AttachConsole(ATTACH_PARENT_PROCESS);
         SetEnvironmentVariableW(L"ONESETUP_SHELL", L"headless");
         const wchar_t* names[] = { L"debug", L"info", L"warn", L"error", L"ask", L"progress", L"title" };
-        return RunScript(script, extra,
+        int headlessCode = RunScript(script, extra,
             [&](Kind k, const std::wstring& t, bool err) { Console(L"[" + std::wstring(err ? L"stderr" : names[(int)k]) + L"] " + t); },
             [&](const std::wstring& t)
             {
@@ -1037,6 +1176,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
                 Console(L"[ask] " + t + L" -> " + (yes ? L"yes" : L"no"));
                 return yes;
             });
+        WriteResult(headlessCode);
+        return headlessCode;
     }
 
     SetEnvironmentVariableW(L"ONESETUP_SHELL", L"ui");
@@ -1063,7 +1204,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     if (!InitGraphics(client.right, client.bottom))
     {
         MessageBoxW(nullptr, L"Direct2D is not available; running the script without a window.", L"OneSetup", MB_OK);
-        return RunScript(script, extra, [](Kind, const std::wstring&, bool) {}, [](const std::wstring&) { return true; });
+        int fallbackCode = RunScript(script, extra, [](Kind, const std::wstring&, bool) {}, [](const std::wstring&) { return true; });
+        WriteResult(fallbackCode);
+        return fallbackCode;
     }
     Relayout();
     ShowWindow(g_hwnd, SW_SHOW);
@@ -1099,5 +1242,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     }
     if (g_job) TerminateJobObject(g_job, 2);
     runner.join();
+    WriteResult(g.exitCode);
     return g.exitCode;
 }
