@@ -12,6 +12,7 @@
 #include <d2d1_1.h>
 #include <dwrite.h>
 #include <dcomp.h>
+#include <wincodec.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
@@ -35,7 +36,7 @@
 using Microsoft::WRL::ComPtr;
 
 // ---------------------------------------------------------------- protocol
-enum class Kind { Debug, Info, Warn, Error, Ask, Progress, Title, Choose, Launch };
+enum class Kind { Debug, Info, Warn, Error, Ask, Progress, Title, Choose, Launch, License, Background };
 
 static std::wstring Trim(const std::wstring& s, const wchar_t* set = L" \t\r\n")
 {
@@ -75,7 +76,7 @@ static void ParseLine(const std::wstring& line, Kind& kind, std::wstring& text)
     std::transform(word.begin(), word.end(), word.begin(), ::towlower);
     static const struct { const wchar_t* name; Kind kind; } table[] = {
         { L"debug", Kind::Debug }, { L"info", Kind::Info }, { L"warn", Kind::Warn }, { L"error", Kind::Error },
-        { L"ask", Kind::Ask }, { L"progress", Kind::Progress }, { L"title", Kind::Title }, { L"choose", Kind::Choose }, { L"launch", Kind::Launch } };
+        { L"ask", Kind::Ask }, { L"progress", Kind::Progress }, { L"title", Kind::Title }, { L"choose", Kind::Choose }, { L"launch", Kind::Launch }, { L"license", Kind::License }, { L"background", Kind::Background } };
     for (auto& entry : table)
         if (word == entry.name)
         {
@@ -120,7 +121,40 @@ static std::atomic<bool> g_cancelled{ false };
 
 typedef std::function<void(Kind, const std::wstring&, bool)> LineHandler;
 // Returns the 1-based number of the chosen option, 0 when cancelled. Yes/no questions: 1 = yes, anything else = no.
-typedef std::function<int(const std::wstring&, const std::vector<std::wstring>&, bool)> AskHandler;
+typedef std::function<int(const std::wstring&, const std::vector<std::wstring>&, bool, const std::wstring&)> AskHandler;   // prompt, options, yes/no, body (license text)
+
+// Reads a text file as UTF-8 (BOM optional) or UTF-16 LE (BOM); empty when it cannot be read.
+static std::wstring ReadTextFile(const std::wstring& path)
+{
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return L"";
+    LARGE_INTEGER size{};
+    std::string bytes;
+    if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && size.QuadPart < (8 << 20))
+    {
+        bytes.resize((size_t)size.QuadPart);
+        DWORD got = 0;
+        if (!ReadFile(f, bytes.data(), (DWORD)bytes.size(), &got, nullptr)) got = 0;
+        bytes.resize(got);
+    }
+    CloseHandle(f);
+    std::wstring text;
+    if (bytes.size() >= 2 && (unsigned char)bytes[0] == 0xFF && (unsigned char)bytes[1] == 0xFE)
+        text.assign((const wchar_t*)(bytes.data() + 2), (bytes.size() - 2) / 2);
+    else
+        text = Utf8ToWide(bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF && (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF ? bytes.substr(3) : bytes);
+    std::wstring out;
+    for (wchar_t c : text) if (c != L'\r') out += c;
+    return out;
+}
+
+// A path from the script may be relative to the script's folder.
+static std::wstring ResolveNextToScript(const std::wstring& script, const std::wstring& path)
+{
+    if (path.size() > 1 && (path[1] == L':' || path[0] == L'\\' && path[1] == L'\\')) return path;
+    size_t slash = script.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : script.substr(0, slash + 1) + path;
+}
 
 // Reads lines until the script's own process has exited and the pipe is drained. It must not wait for EOF: a program
 // the script starts (for example "start app.exe") inherits the pipe and would keep the installer window open.
@@ -187,15 +221,33 @@ static int RunScript(const std::wstring& script, const std::wstring& extra, cons
     {
         Kind kind; std::wstring text;
         ParseLine(line, kind, text);
-        if (kind == Kind::Ask || kind == Kind::Choose)
+        if (kind == Kind::Background)
         {
-            const bool yesNo = kind == Kind::Ask;
-            std::wstring prompt;
+            onLine(kind, ResolveNextToScript(script, Trim(text, L" \t")), false);
+            return;
+        }
+        if (kind == Kind::Ask || kind == Kind::Choose || kind == Kind::License)
+        {
+            const bool yesNo = kind != Kind::Choose;
+            std::wstring prompt, body;
             std::vector<std::wstring> options;
-            ParseChoices(text, yesNo, prompt, options);
             int picked = 0;
-            if (!yesNo && options.size() < 2) onLine(Kind::Error, L"choose needs a prompt and 2 to 5 options separated by | or ;", false);
-            else picked = onAsk(prompt, options, yesNo);
+            if (kind == Kind::License)
+            {
+                // ".license file.txt | I agree | Decline": the user must accept before the script goes on; answer yes/no
+                ParseChoices(text, true, prompt, options);
+                std::wstring file = ResolveNextToScript(script, Trim(prompt, L" \t")), label = L"License agreement";
+                body = ReadTextFile(file);
+                if (text.find(L'|') == std::wstring::npos) options = { L"I agree", L"Decline" };
+                if (body.empty()) { onLine(Kind::Error, L"license file not found or empty: " + file, false); picked = 2; }
+                else picked = onAsk(label, options, true, body);
+            }
+            else
+            {
+                ParseChoices(text, yesNo, prompt, options);
+                if (!yesNo && options.size() < 2) onLine(Kind::Error, L"choose needs a prompt and 2 to 5 options separated by | or ;", false);
+                else picked = onAsk(prompt, options, yesNo, L"");
+            }
             std::string answer = yesNo ? (picked == 1 ? "yes" : "no") : std::to_string(picked);
             answer += (char)13;
             answer += (char)10;
@@ -231,7 +283,8 @@ static struct Model
     std::deque<std::wstring> log;
     int logScroll = 0;
     bool details = false, finished = false, ask = false, cancelConfirm = false;
-    std::wstring askText;
+    std::wstring askText, askBody, bgPath;   // askBody: license text (non-empty = license sheet); bgPath: ".background" image
+    float licScroll = 0.f, licMax = 0.f;
     std::vector<std::wstring> choices;   // option labels of the open sheet; yes/no sheets use [yes label, no label]
     bool yesNo = true;
     int exitCode = 0;
@@ -241,7 +294,7 @@ static struct Model
 } g;
 
 struct Event { Kind kind; std::wstring text; bool fromStderr; };
-struct AskRequest { std::wstring text; std::vector<std::wstring> options; bool yesNo; HANDLE done; int answer; };
+struct AskRequest { std::wstring text; std::vector<std::wstring> options; bool yesNo; std::wstring body; HANDLE done; int answer; };
 constexpr UINT WM_EVENT = WM_APP + 1, WM_ASK = WM_APP + 2, WM_DONE = WM_APP + 3;
 constexpr UINT_PTR TimerAnimate = 1, TimerClose = 2;
 
@@ -263,7 +316,7 @@ static ComPtr<IDCompositionTarget> dcompTarget;
 static ComPtr<IDCompositionVisual> dcompVisual;
 static ComPtr<ID2D1SolidColorBrush> brush;
 static ComPtr<ID2D1StrokeStyle> roundStroke;
-static ComPtr<IDWriteTextFormat> fTitle, fSub, fBody, fSmall, fMono, fButton, fButtonLarge, fButtonBold, fCenter, fPercent, fAsk, fAskIcon;
+static ComPtr<IDWriteTextFormat> fTitle, fSub, fBody, fSmall, fMono, fButton, fButtonLarge, fButtonBold, fCenter, fPercent, fAsk, fAskIcon, fLicense;
 
 constexpr float WidthDip = 520.f, HeightDip = 424.f, Pad = 32.f;
 static float Scale() { return g_dpi / 96.f; }
@@ -353,6 +406,7 @@ static bool InitGraphics(int w, int h)
     fPercent = MakeFormat(family, 28, DWRITE_FONT_WEIGHT_LIGHT, true);
     fPercent->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     fAsk = MakeFormat(family, 15, DWRITE_FONT_WEIGHT_NORMAL, false);
+    fLicense = MakeFormat(family, 12.5f, DWRITE_FONT_WEIGHT_NORMAL, false);
     fAskIcon = MakeFormat(family, 22, DWRITE_FONT_WEIGHT_SEMI_BOLD, false, true);
 
     if (FAILED(DCompositionCreateDevice(dxgiDevice.Get(), IID_PPV_ARGS(&dcompDevice)))) return false;
@@ -471,6 +525,37 @@ static void Pill(float x, float y, float w, float h, const std::wstring& label, 
     }
     Text(label, fButton.Get(), x, y, w, h);
     g_regions.push_back({ D2D1::RectF(x, y, x + w, y + h), id });
+}
+
+// ".background image.png": decoded once (WIC: png, jpg, bmp, gif...) and drawn cover-fit under a white veil so text stays readable.
+static ComPtr<ID2D1Bitmap1> g_bgBitmap;
+static std::wstring g_bgLoaded;
+static void DrawBackgroundImage()
+{
+    if (g.bgPath != g_bgLoaded)
+    {
+        g_bgLoaded = g.bgPath;
+        g_bgBitmap.Reset();
+        ComPtr<IWICImagingFactory> wic;
+        ComPtr<IWICBitmapDecoder> decoder;
+        ComPtr<IWICBitmapFrameDecode> frame;
+        ComPtr<IWICFormatConverter> converter;
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (!g.bgPath.empty() && SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+            SUCCEEDED(wic->CreateDecoderFromFilename(g.bgPath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder)) &&
+            SUCCEEDED(decoder->GetFrame(0, &frame)) && SUCCEEDED(wic->CreateFormatConverter(&converter)) &&
+            SUCCEEDED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeMedianCut)))
+        {
+            ComPtr<ID2D1Bitmap> plain;
+            if (SUCCEEDED(dc->CreateBitmapFromWicBitmap(converter.Get(), nullptr, &plain))) plain.As(&g_bgBitmap);
+        }
+    }
+    if (!g_bgBitmap) return;
+    D2D1_SIZE_F size = g_bgBitmap->GetSize();
+    float k = std::max(WidthDip / size.width, HeightDip / size.height), w = size.width * k, h = size.height * k;
+    dc->DrawBitmap(g_bgBitmap.Get(), D2D1::RectF((WidthDip - w) / 2, (HeightDip - h) / 2, (WidthDip + w) / 2, (HeightDip + h) / 2));
+    SetColor(255, 255, 255, 0.62f);
+    dc->FillRectangle(D2D1::RectF(0, 0, WidthDip, HeightDip), brush.Get());
 }
 
 static void DrawStepIcon(const Step& s, float cx, float cy, float angle)
@@ -624,6 +709,42 @@ static float LabelWidth(const std::wstring& label)
 }
 
 // Question sheet: a glass panel that rises from the bottom edge, in the same language as the card and pills.
+// ".license": a large sheet with the scrollable agreement text and two buttons (answer yes/no).
+static void DrawLicenseSheet(float e)
+{
+    const float margin = 14.f, pad = 22.f, btnH = 40.f, x0 = margin, sw = WidthDip - 2 * margin;
+    const float sh = HeightDip - 2 * margin, y0 = margin + (1.f - e) * 30.f;
+    SoftShadow(x0, y0, x0 + sw, y0 + sh, 20.f, -4.f, 22.f);
+    SetColor(255, 255, 255, 0.95f);
+    dc->FillRoundedRectangle(RR(x0, y0, x0 + sw, y0 + sh, 20.f), brush.Get());
+    Ink();
+    Text(g.askText, fButtonBold.Get(), x0 + pad, y0 + 14, sw - 2 * pad, 28);
+
+    const float ty = y0 + 50.f, th = sh - 50.f - btnH - 2 * pad + 6.f, tw = sw - 2 * pad - 10.f;
+    SetColor(244, 245, 247, 0.9f);
+    dc->FillRoundedRectangle(RR(x0 + pad - 8, ty - 4, x0 + sw - pad + 8, ty + th + 4, 10.f), brush.Get());
+    ComPtr<IDWriteTextLayout> layout;
+    dwrite->CreateTextLayout(g.askBody.c_str(), (UINT32)g.askBody.size(), fLicense.Get(), tw, 100000.f, &layout);
+    DWRITE_TEXT_METRICS m{};
+    layout->GetMetrics(&m);
+    g.licMax = std::max(0.f, m.height - th);
+    g.licScroll = std::max(0.f, std::min(g.licScroll, g.licMax));
+    dc->PushAxisAlignedClip(D2D1::RectF(x0 + pad, ty, x0 + sw - pad - 10, ty + th), D2D1_ANTIALIAS_MODE_ALIASED);
+    Ink();
+    dc->DrawTextLayout(D2D1::Point2F(x0 + pad, ty - g.licScroll), layout.Get(), brush.Get());
+    dc->PopAxisAlignedClip();
+    if (g.licMax > 0.f)
+    {
+        float barH = std::max(24.f, th * th / m.height), barY = ty + (th - barH) * (g.licScroll / g.licMax);
+        SetColor(60, 60, 67, 0.35f);
+        dc->FillRoundedRectangle(RR(x0 + sw - pad - 3, barY, x0 + sw - pad + 1, barY + barH, 2.f), brush.Get());
+    }
+    float by = y0 + sh - pad - btnH + 6.f;
+    float yesW = std::max(110.f, LabelWidth(g.choices[0]) + 40.f), noW = std::max(96.f, LabelWidth(g.choices[1]) + 40.f);
+    Pill(x0 + sw - pad - yesW, by, yesW, btnH, g.choices[0], BtnYes, true);
+    Pill(x0 + sw - pad - yesW - 12.f - noW, by, noW, btnH, g.choices[1], BtnNo, false);
+}
+
 static void DrawAskSheet()
 {
     float e = EaseOut(Since(g.askTick, 260.f));
@@ -631,6 +752,7 @@ static void DrawAskSheet()
     dc->FillRectangle(D2D1::RectF(0, 0, WidthDip, HeightDip), brush.Get());
 
     const float margin = 14.f, sw = WidthDip - 2 * margin, pad = 22.f, iconD = 40.f, btnH = 40.f;
+    if (!g.askBody.empty()) { DrawLicenseSheet(e); return; }
     ComPtr<IDWriteTextLayout> layout;
     float textW = sw - 2 * pad - iconD - 16.f;
     dwrite->CreateTextLayout(g.askText.c_str(), (UINT32)g.askText.size(), fAsk.Get(), textW, 1000.f, &layout);
@@ -688,6 +810,7 @@ static void Draw()
         dc->FillRectangle(D2D1::RectF(0, 0, WidthDip, HeightDip), brush.Get());
     }
     else dc->Clear(D2D1::ColorF(244 / 255.f, 245 / 255.f, 247 / 255.f, 1.f));
+    DrawBackgroundImage();
     {   // colour wash: indigo at the top-left, rose at the bottom-right, pulled toward green once done
         float done = ok ? EaseOut(Since(g.finishTick, 900.f)) : 0.f;
         auto wash = Linear(0, 0, WidthDip, HeightDip, { { 0.f, Lerp(110, 80, done), Lerp(140, 215, done), Lerp(255, 160, done), g_glass ? 0.20f : 0.12f },
@@ -838,6 +961,9 @@ static void OnEvent(Event* e)
         g.title = e->text;
         SetWindowTextW(g_hwnd, (e->text + L" - Setup").c_str());
         break;
+    case Kind::Background:
+        g.bgPath = e->text;
+        break;
     case Kind::Launch:
     {
         size_t bar = e->text.find(L'|');
@@ -983,7 +1109,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
     case WM_MOUSEWHEEL:
-        if (g.details)
+        if (g.ask && !g.askBody.empty())
+        {
+            g.licScroll = std::max(0.f, std::min(g.licMax, g.licScroll - GET_WHEEL_DELTA_WPARAM(wParam) / 120.f * 48.f));
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        else if (g.details)
         {
             g.logScroll = std::max(0, std::min((int)g.log.size() - 1, g.logScroll + (GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 3 : -3)));
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -991,6 +1122,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) { if (g.ask) CloseAsk(false); else if (g.finished) DestroyWindow(hwnd); else RequestCancel(); }
+        else if (g.ask && !g.askBody.empty())   // license: Enter does not accept, only the button does; arrows scroll
+        {
+            float step = wParam == VK_DOWN ? 48.f : wParam == VK_UP ? -48.f : wParam == VK_NEXT ? 200.f : wParam == VK_PRIOR ? -200.f : 0.f;
+            if (wParam == VK_HOME) g.licScroll = 0.f; else if (wParam == VK_END) g.licScroll = g.licMax;
+            g.licScroll = std::max(0.f, std::min(g.licMax, g.licScroll + step));
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         else if (wParam == VK_RETURN) { if (g.ask) CloseAsk(true); else if (g.finished && !LaunchProgram()) DestroyWindow(hwnd); }
         else if (g.ask && !g.yesNo)
         {
@@ -1012,6 +1150,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g.yesNo = g_pendingAsk->yesNo;
         g.choices = g_pendingAsk->options;
         g.askText = g_pendingAsk->text;
+        g.askBody = g_pendingAsk->body;
+        g.licScroll = 0.f;
         Wake();
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -1444,16 +1584,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     {
         AttachConsole(ATTACH_PARENT_PROCESS);
         SetEnvironmentVariableW(L"ONESETUP_SHELL", L"headless");
-        const wchar_t* names[] = { L"debug", L"info", L"warn", L"error", L"ask", L"progress", L"title", L"choose", L"launch" };
+        const wchar_t* names[] = { L"debug", L"info", L"warn", L"error", L"ask", L"progress", L"title", L"choose", L"launch", L"license", L"background" };
         int headlessCode = RunScript(script, extra,
             [&](Kind k, const std::wstring& t, bool err) { Console(L"[" + std::wstring(err ? L"stderr" : names[(int)k]) + L"] " + t); },
-            [&](const std::wstring& t, const std::vector<std::wstring>& options, bool yesNo)
+            [&](const std::wstring& t, const std::vector<std::wstring>& options, bool yesNo, const std::wstring& body)
             {
                 wchar_t a[8];
                 if (yesNo)
                 {
                     bool yes = !(GetEnvironmentVariableW(L"ONESETUP_ASK", a, 8) && _wcsicmp(a, L"no") == 0);
-                    Console(L"[ask] " + t + L" -> " + (yes ? L"yes" : L"no"));
+                    Console((body.empty() ? L"[ask] " : L"[license] ") + t + L" -> " + (yes ? L"yes" : L"no"));
                     return yes ? 1 : 2;
                 }
                 int pick = GetEnvironmentVariableW(L"ONESETUP_CHOICE", a, 8) ? _wtoi(a) : 1;   // ONESETUP_CHOICE=0 simulates dismissing the sheet
@@ -1493,7 +1633,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     if (!InitGraphics(client.right, client.bottom))
     {
         MessageBoxW(nullptr, L"Direct2D is not available; running the script without a window.", L"OneSetup", MB_OK);
-        int fallbackCode = RunScript(script, extra, [](Kind, const std::wstring&, bool) {}, [](const std::wstring&, const std::vector<std::wstring>&, bool) { return 1; });
+        int fallbackCode = RunScript(script, extra, [](Kind, const std::wstring&, bool) {}, [](const std::wstring&, const std::vector<std::wstring>&, bool, const std::wstring&) { return 1; });
         WriteResult(fallbackCode);
         return fallbackCode;
     }
@@ -1512,9 +1652,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     {
         int code = RunScript(script, extra,
             [](Kind k, const std::wstring& t, bool err) { PostMessageW(g_hwnd, WM_EVENT, 0, (LPARAM) new Event{ k, t, err }); },
-            [](const std::wstring& t, const std::vector<std::wstring>& options, bool yesNo)
+            [](const std::wstring& t, const std::vector<std::wstring>& options, bool yesNo, const std::wstring& body)
             {
-                AskRequest request{ t, options, yesNo, CreateEventW(nullptr, TRUE, FALSE, nullptr), 0 };
+                AskRequest request{ t, options, yesNo, body, CreateEventW(nullptr, TRUE, FALSE, nullptr), 0 };
                 PostMessageW(g_hwnd, WM_ASK, 0, (LPARAM)&request);
                 WaitForSingleObject(request.done, INFINITE);
                 CloseHandle(request.done);

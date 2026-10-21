@@ -149,7 +149,7 @@ footer a{text-decoration:none}footer a:hover{color:var(--ink)}
 <main class="wrap" id="top">
   <div class="hero">
     <div>
-      <span class="eyebrow glass"><i></i><span id="ver">v4.0</span> · Windows · <span>single file</span></span>
+      <span class="eyebrow glass"><i></i><span id="ver">v4.1</span> · Windows · <span>single file</span></span>
       <h1><span>One folder.</span><br><span style="background-image:linear-gradient(100deg,var(--violet),#ff6bb0)">One installer.</span></h1>
       <p class="lead">Pack any folder into a single .exe that extracts itself and runs your install.bat (or, with --app, starts your program from a cache) — with a frosted-glass progress window, a rolling log and a finish animation. No runtime to install.</p>
       <div class="cta">
@@ -255,6 +255,9 @@ footer a{text-decoration:none}footer a:hover{color:var(--ink)}
         <div><code>.progress 0-100</code><span>Progress bar</span></div>
         <div><code>.ask</code><span>Yes/No sheet (labels can be customized); the answer arrives on stdin</span></div>
         <div><code>.choose</code><span>Multiple choice, 2 to 5 options: <code>.choose Pick one; A; B; C</code>. The chosen number arrives on stdin.</span></div>
+        <div><code>.launch</code><span>Launch button on the done screen: <code>.launch %TARGET%pp.exe | Open App</code></span></div>
+        <div><code>.license</code><span>Scrollable agreement sheet from a text file; the answer (yes/no) arrives on stdin</span></div>
+        <div><code>.background</code><span>Optional background picture (png, jpg, bmp, gif)</span></div>
         <div><code>(other)</code><span>Kept in the Details log</span></div>
       </div>
     </div>

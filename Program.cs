@@ -460,6 +460,9 @@ static class Program
               .choose <prompt>; <option 1>; <option 2>; ...   2 to 5 options, ';' or '|' as separator ('|' needs ^| in .bat);
                   the 1-based number of the chosen option arrives on stdin (0 = dismissed):  set /p PICK=
                   Keys: 1-5 pick, Enter = first option, Esc = dismiss.
+              .launch <path> [| label]   after a successful install the done screen offers a Launch button (Enter too).
+              .license <file.txt> [| agree label | decline label]   scrollable agreement; answers "yes" or "no" on stdin.
+              .background <image>   optional background picture (png, jpg, bmp, gif), relative to install.bat.
               All other output is kept in the Details log. Keep install.bat ASCII and print localised text from a UTF-8
               file with "type msg.txt". stdin carries the answers, so do not use pause or choice: ONESETUP_SHELL is set to
               "ui" (or "headless") for the script, e.g.  if not defined ONESETUP_SHELL pause. Full reference: ui/README.md.

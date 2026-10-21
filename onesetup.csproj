@@ -7,7 +7,7 @@
     <AssemblyName>onesetup</AssemblyName>
     <RootNamespace>OneSetup</RootNamespace>
     <ApplicationIcon>assets\onesetup.ico</ApplicationIcon>
-    <Version>4.0.0</Version>
+    <Version>4.1.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <InvariantGlobalization>true</InvariantGlobalization>
     <!-- The UI shell is built from ui\native (MSVC, C++) on every build and embedded. Pass -p:OneSetupUiExe=<path>

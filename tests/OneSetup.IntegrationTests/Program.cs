@@ -113,6 +113,7 @@ static class Program
         await AssertFailureExitCodeAsync(packerPath, runnerDirectory, testRoot);
         await AssertAppModeAsync(packerPath, runnerDirectory, testRoot);
         await AssertChoiceProtocolAsync(packerPath, runnerDirectory, testRoot);
+        await AssertLicenseProtocolAsync(packerPath, runnerDirectory, testRoot);
         await AssertIconAsync(packerPath, runnerDirectory, testRoot);
         await AssertLaunchedProgramSurvivesAsync(packerPath, runnerDirectory, testRoot);
 
@@ -362,6 +363,38 @@ static class Program
         Ensure(await Run("1", "no") == "picked=1 pipe=1 ask=no bad=0", "The first option or the no answer did not reach install.bat.");
         Ensure(await Run("0", "yes") == "picked=0 pipe=0 ask=yes bad=0", "Dismissing a choice did not answer 0.");
         Ensure(await Run("9", "yes") == "picked=0 pipe=0 ask=yes bad=0", "An out-of-range choice did not answer 0.");
+    }
+
+    // .license answers yes/no on stdin (headless: ONESETUP_ASK), .background resolves next to the script.
+    static async Task AssertLicenseProtocolAsync(string packerPath, string runnerDirectory, string testRoot)
+    {
+        string source = Path.Combine(testRoot, "license-source");
+        Directory.CreateDirectory(source);
+        await File.WriteAllTextAsync(Path.Combine(source, "license.txt"), "You may use this software.\r\n");
+        await File.WriteAllTextAsync(Path.Combine(source, "install.bat"),
+            "@echo off\r\n" +
+            "echo .background missing.png\r\n" +
+            "echo .license license.txt\r\n" +
+            "set \"OK=\"\r\n" +
+            "set /p OK=\r\n" +
+            ">\"%LICENSE_OUT%\" echo %OK%\r\n" +
+            "echo .license nothere.txt\r\n" +
+            "set \"NO=\"\r\n" +
+            "set /p NO=\r\n" +
+            ">>\"%LICENSE_OUT%\" echo %NO%\r\n" +
+            "if /i not \"%OK%\"==\"yes\" exit /b 7\r\n" +
+            "exit /b 0\r\n");
+        string setup = Path.Combine(runnerDirectory, "license_setup.exe");
+        ProcessResult pack = await RunProcessAsync(packerPath, [source, "-o", setup, "-l", "1", "--ui"], runnerDirectory, timeout: TestTimeout);
+        Ensure(pack.ExitCode == 0, $"Packing failed. {pack.StandardError}");
+        foreach ((string ask, int code, string lines) in new[] { ("yes", 0, "yes no"), ("no", 7, "no no") })
+        {
+            string output = Path.Combine(testRoot, $"license-{ask}.txt");
+            ProcessResult run = await RunProcessAsync(setup, ["-y"], runnerDirectory,
+                new Dictionary<string, string?> { ["ONESETUP_UI"] = "0", ["ONESETUP_ASK"] = ask, ["LICENSE_OUT"] = output }, TestTimeout);
+            Ensure(run.ExitCode == code && File.Exists(output), $"License run '{ask}' returned {run.ExitCode}, expected {code}. {run.StandardError}");
+            Ensure(string.Join(' ', File.ReadAllLines(output).Select(line => line.Trim())) == lines, $"License answers were wrong for '{ask}'.");
+        }
     }
 
     // --app: first run extracts into a per-user cache keyed by the payload hash, later runs start the program directly.
