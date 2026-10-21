@@ -993,7 +993,7 @@ static void Console(const std::wstring& text)
 // The 7zSD module always exits 0. A packaged setup.exe is therefore [this exe][inner 7zSD installer][offset + "ONESETUP"]:
 // started that way, this exe runs the inner installer, which runs `onesetup-ui.exe <script>` in the extraction folder; the
 // shell writes the script's exit code to the file named by ONESETUP_RESULT, and the outer exe returns that code.
-struct StubFooter { unsigned long long offset; char magic[8]; };
+struct StubFooter { unsigned long long offset; unsigned int metaLength, reserved; char magic[8]; };   // 24 bytes, magic "ONESETU2"
 
 static void WriteResult(int code)
 {
@@ -1017,6 +1017,147 @@ static std::wstring ArgumentsAfterProgram()
     return p;
 }
 
+struct StubMeta { std::wstring mode, id, entry; };
+
+static StubMeta ParseMeta(const std::string& text)
+{
+    StubMeta meta;
+    size_t start = 0;
+    while (start < text.size())
+    {
+        size_t nl = text.find('\n', start);
+        if (nl == std::string::npos) nl = text.size();
+        std::string line = text.substr(start, nl - start);
+        start = nl + 1;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::wstring key = Utf8ToWide(line.substr(0, eq)), value = Utf8ToWide(line.substr(eq + 1));
+        if (key == L"mode") meta.mode = value;
+        else if (key == L"id") meta.id = value;
+        else if (key == L"entry") meta.entry = value;
+    }
+    return meta;
+}
+
+static bool PathExists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+static void MakeDirs(const std::wstring& path)
+{
+    for (size_t i = 3; i <= path.size(); i++)
+        if (i == path.size() || path[i] == L'\\')
+            CreateDirectoryW(path.substr(0, i).c_str(), nullptr);
+}
+
+static void RemoveTree(const std::wstring& dir)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            std::wstring name = fd.cFileName;
+            if (name == L"." || name == L"..") continue;
+            std::wstring full = dir + L"\\" + name;
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) RemoveTree(full);
+            else
+            {
+                SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
+                if (!DeleteFileW(full.c_str())) RemoveDirectoryW(full.c_str());
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryW(dir.c_str());
+}
+
+static bool CopyTree(const std::wstring& from, const std::wstring& to)
+{
+    CreateDirectoryW(to.c_str(), nullptr);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((from + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool ok = true;
+    do
+    {
+        std::wstring name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ok = CopyTree(from + L"\\" + name, to + L"\\" + name) && ok;
+        else ok = CopyFileW((from + L"\\" + name).c_str(), (to + L"\\" + name).c_str(), FALSE) && ok;
+    } while (ok && FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
+}
+
+static bool EndsWithNoCase(const std::wstring& s, const wchar_t* suffix)
+{
+    size_t n = wcslen(suffix);
+    return s.size() >= n && _wcsicmp(s.c_str() + s.size() - n, suffix) == 0;
+}
+
+// Starts the packaged program from its cache folder with the caller's arguments, working directory and console.
+static int LaunchApp(const std::wstring& appDir, const std::wstring& entry)
+{
+    SetEnvironmentVariableW(L"ONESETUP_RESULT", nullptr);
+    SetEnvironmentVariableW(L"ONESETUP_CACHE_TARGET", nullptr);
+    std::wstring path = appDir + L"\\" + entry, args = ArgumentsAfterProgram();
+    bool script = EndsWithNoCase(path, L".bat") || EndsWithNoCase(path, L".cmd");
+    std::wstring command = script ? L"cmd.exe /d /c call \"" + path + L"\" " + args : L"\"" + path + L"\" " + args;
+    SetConsoleCtrlHandler(nullptr, TRUE);   // Ctrl+C belongs to the program, not to this launcher
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) return 1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)code;
+}
+
+// `onesetup-ui.exe --cache-commit`, run by the inner 7zSD installer inside its extraction folder: moves the extracted files
+// into the cache folder (ONESETUP_CACHE_TARGET) via a staging folder and a final rename, so a half-finished or racing
+// extraction never leaves a usable-looking cache entry.
+static int CacheCommit()
+{
+    wchar_t buffer[MAX_PATH * 2];
+    DWORD n = GetEnvironmentVariableW(L"ONESETUP_CACHE_TARGET", buffer, (DWORD)std::size(buffer));
+    if (n == 0 || n >= std::size(buffer)) return 2;
+    std::wstring target = buffer;
+    GetModuleFileNameW(nullptr, buffer, (DWORD)std::size(buffer));
+    std::wstring self = buffer;
+    size_t slash = self.find_last_of(L'\\');
+    std::wstring source = self.substr(0, slash), selfName = self.substr(slash + 1);
+    std::wstring staging = target + L".tmp-" + std::to_wstring(GetCurrentProcessId());
+    MakeDirs(staging);
+    bool ok = PathExists(staging);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = ok ? FindFirstFileW((source + L"\\*").c_str(), &fd) : INVALID_HANDLE_VALUE;
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            std::wstring name = fd.cFileName;
+            if (name == L"." || name == L".." || _wcsicmp(name.c_str(), selfName.c_str()) == 0) continue;
+            std::wstring from = source + L"\\" + name, to = staging + L"\\" + name;
+            if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_COPY_ALLOWED)) continue;
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && CopyTree(from, to)) { RemoveTree(from); continue; }
+            ok = false;
+        } while (ok && FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (ok)
+    {
+        HANDLE marker = CreateFileW((staging + L"\\.ready").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ok = marker != INVALID_HANDLE_VALUE;
+        if (ok) CloseHandle(marker);
+    }
+    if (ok) ok = MoveFileExW(staging.c_str(), target.c_str(), 0) || PathExists(target + L"\\.ready");   // lost a race: the winner's copy is fine
+    if (PathExists(staging)) RemoveTree(staging);
+    return ok ? 0 : 1;
+}
+
 static bool RunAsStub(int& exitCode)
 {
     wchar_t self[MAX_PATH * 2];
@@ -1031,9 +1172,45 @@ static bool RunAsStub(int& exitCode)
     {
         at.QuadPart = size.QuadPart - (LONGLONG)sizeof footer;
         ok = SetFilePointerEx(file, at, nullptr, FILE_BEGIN) && ReadFile(file, &footer, sizeof footer, &got, nullptr) && got == sizeof footer &&
-            memcmp(footer.magic, "ONESETUP", 8) == 0 && (LONGLONG)footer.offset < at.QuadPart;
+            memcmp(footer.magic, "ONESETU2", 8) == 0 && (LONGLONG)footer.metaLength < at.QuadPart &&
+            (LONGLONG)footer.offset < at.QuadPart - (LONGLONG)footer.metaLength;
     }
     if (!ok) { CloseHandle(file); return false; }
+
+    LONGLONG innerEnd = at.QuadPart - (LONGLONG)footer.metaLength;
+    std::string metaText(footer.metaLength, '\0');
+    LARGE_INTEGER metaAt{};
+    metaAt.QuadPart = innerEnd;
+    if (footer.metaLength > 0 && !(SetFilePointerEx(file, metaAt, nullptr, FILE_BEGIN) && ReadFile(file, metaText.data(), footer.metaLength, &got, nullptr) && got == footer.metaLength))
+    {
+        CloseHandle(file);
+        exitCode = 1;
+        return true;
+    }
+    StubMeta meta = ParseMeta(metaText);
+    bool app = meta.mode == L"app" && !meta.id.empty() && !meta.entry.empty();
+
+    std::wstring appDir;
+    if (app)
+    {
+        wchar_t root[MAX_PATH * 2];
+        DWORD n = GetEnvironmentVariableW(L"ONESETUP_CACHE", root, (DWORD)std::size(root));
+        std::wstring cacheRoot;
+        if (n > 0 && n < std::size(root)) cacheRoot = root;
+        else
+        {
+            n = GetEnvironmentVariableW(L"LOCALAPPDATA", root, (DWORD)std::size(root));
+            if (n == 0 || n >= std::size(root)) { CloseHandle(file); exitCode = 1; return true; }
+            cacheRoot = std::wstring(root) + L"\\OneSetup\\apps";
+        }
+        appDir = cacheRoot + L"\\" + meta.id;
+        if (PathExists(appDir + L"\\.ready"))   // warm start: nothing to extract
+        {
+            CloseHandle(file);
+            exitCode = LaunchApp(appDir, meta.entry);
+            return true;
+        }
+    }
 
     wchar_t temp[MAX_PATH];
     GetTempPathW(MAX_PATH, temp);
@@ -1062,7 +1239,7 @@ static bool RunAsStub(int& exitCode)
         cleanup();
         return true;
     }
-    LONGLONG remaining = at.QuadPart - (LONGLONG)footer.offset;
+    LONGLONG remaining = innerEnd - (LONGLONG)footer.offset;
     std::vector<char> buffer(1 << 20);
     while (remaining > 0)
     {
@@ -1075,7 +1252,8 @@ static bool RunAsStub(int& exitCode)
     if (remaining > 0) { cleanup(); return true; }
 
     SetEnvironmentVariableW(L"ONESETUP_RESULT", result.c_str());
-    std::wstring command = L"\"" + inner + L"\" " + ArgumentsAfterProgram();
+    if (app) SetEnvironmentVariableW(L"ONESETUP_CACHE_TARGET", appDir.c_str());
+    std::wstring command = L"\"" + inner + L"\" " + (app ? L"-y" : ArgumentsAfterProgram());
     STARTUPINFOW si{};
     si.cb = sizeof si;
     PROCESS_INFORMATION pi{};
@@ -1085,6 +1263,13 @@ static bool RunAsStub(int& exitCode)
     GetExitCodeProcess(pi.hProcess, &innerCode);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+
+    if (app)
+    {
+        cleanup();   // first run finished: the cache now holds the files; start the program
+        exitCode = PathExists(appDir + L"\\.ready") ? LaunchApp(appDir, meta.entry) : 1;
+        return true;
+    }
 
     exitCode = (int)innerCode;   // extraction failed or was cancelled: no result file, keep the module's own code
     HANDLE r = CreateFileW(result.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1124,7 +1309,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     }
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    bool headless = false, noGlass = false, plain = false;
+    bool headless = false, noGlass = false, plain = false, cacheCommit = false;
     std::vector<std::wstring> rest;
     for (int i = 1; i < argc; i++)
     {
@@ -1133,8 +1318,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         else if (a == L"--auto-close") g_autoClose = true;
         else if (a == L"--no-glass") noGlass = true;
         else if (a == L"--plain") plain = true;
+        else if (a == L"--cache-commit") cacheCommit = true;
         else rest.push_back(a);
     }
+    if (cacheCommit) return CacheCommit();
     wchar_t env[8];
     if (GetEnvironmentVariableW(L"ONESETUP_UI", env, 8) && wcscmp(env, L"0") == 0) headless = true;
     if (rest.empty())

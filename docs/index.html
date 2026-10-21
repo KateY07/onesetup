@@ -72,7 +72,7 @@ pre .c{color:#7d849c}pre .k{color:#7fb4ff}pre .s{color:#ffcf8a}pre .p{color:#c8a
 .tbl div{display:grid;grid-template-columns:150px 1fr;gap:12px;padding:12px 18px;border-top:1px solid var(--line);font-size:14.5px}
 .tbl div:first-child{border-top:0}
 .tbl code{font:13px Consolas,monospace;color:var(--indigo)}
-.notes{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.notes{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
 .note{border-radius:20px;padding:20px 22px;font-size:14.5px;color:var(--muted)}
 .note b{display:block;color:var(--ink);margin-bottom:4px;font-size:15.5px}
 footer{padding:44px 0 56px;color:var(--muted);font-size:14px;display:flex;flex-wrap:wrap;gap:12px 26px;justify-content:space-between;border-top:1px solid var(--line);margin-top:30px}
@@ -140,6 +140,7 @@ footer a{text-decoration:none}footer a:hover{color:var(--ink)}
   <a class="brand" href="#top"><img src="favicon.svg" alt="">OneSetup</a>
   <a class="link" href="#features">Features</a>
   <a class="link" href="#start">Quick start</a>
+  <a class="link" href="#apps">Apps</a>
   <a class="link" href="#protocol">UI protocol</a>
   <a class="link" href="https://github.com/KateY07/onesetup">GitHub</a>
   <a class="btn primary small dl" href="https://github.com/KateY07/onesetup/releases">Download</a>
@@ -150,7 +151,7 @@ footer a{text-decoration:none}footer a:hover{color:var(--ink)}
     <div>
       <span class="eyebrow glass"><i></i><span id="ver">v3.pre11</span> · Windows · <span>single file</span></span>
       <h1><span>One folder.</span><br><span style="background-image:linear-gradient(100deg,var(--violet),#ff6bb0)">One installer.</span></h1>
-      <p class="lead">Pack any folder into a single .exe that extracts itself and runs your install.bat — with a frosted-glass progress window, a rolling log and a finish animation. No runtime to install.</p>
+      <p class="lead">Pack any folder into a single .exe that extracts itself and runs your install.bat (or, with --app, starts your program from a cache) — with a frosted-glass progress window, a rolling log and a finish animation. No runtime to install.</p>
       <div class="cta">
         <a class="btn primary" id="download" href="https://github.com/KateY07/onesetup/releases/latest"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="M7 11l5 5 5-5"/><path d="M5 20h14"/></svg><span>Download installer</span></a>
         <a class="btn" id="portable" href="https://github.com/KateY07/onesetup/releases">Portable onesetup.exe</a>
@@ -211,6 +212,26 @@ footer a{text-decoration:none}footer a:hover{color:var(--ink)}
     </div>
   </section>
 
+  <section id="apps">
+    <h2>Single-file apps, quick second launch</h2>
+    <p class="sub">Not every folder is an installer. With --app the .exe is the program itself: the first run unpacks it into a per-user cache, every later run starts it straight from there.</p>
+    <div class="two">
+      <pre><button class="copy" data-copy="onesetup tool --app tool.exe -l 1 -o tool_portable.exe">copy</button><span class="c"># pack a tool and its files into one exe</span>
+<span class="k">onesetup</span> tool <span class="p">--app</span> tool.exe <span class="p">-l</span> 1 -o tool_portable.exe
+
+<span class="c"># first run: unpacks to %LOCALAPPDATA%\OneSetup\apps, then starts</span>
+<span class="c"># later runs: one marker check, then the program</span>
+<span class="k">tool_portable.exe</span> --any args</pre>
+      <div class="tbl glass">
+        <div><code>Warm start</code><span>About one extra process start over running the program directly (roughly 10 ms measured). No extraction, no hashing, no window.</span></div>
+        <div><code>Pass-through</code><span>Arguments, working directory, console, Ctrl+C and the exit code reach the program unchanged.</span></div>
+        <div><code>Cache</code><span>Keyed by the payload hash; new builds get a new folder. ONESETUP_CACHE moves it.</span></div>
+        <div><code>Parallel first runs</code><span>Safe: files are staged, then renamed atomically, so exactly one copy remains.</span></div>
+        <div><code>First run</code><span>Slower: it goes through the 7-Zip self-extractor (about 2 s for a tiny payload, mostly fixed cost). Use -l 1 or 0 for big payloads.</span></div>
+      </div>
+    </div>
+  </section>
+
   <section id="protocol">
     <h2>Your script drives the window</h2>
     <p class="sub">Lines starting with a dot are commands; everything else lands in the Details log.</p>
@@ -245,6 +266,7 @@ footer a{text-decoration:none}footer a:hover{color:var(--ink)}
       <div class="note glass"><b>Exit codes that mean something</b><span>setup.exe returns install.bat's exit code, so scripts and CI can detect a failed install. Cancelling the window returns 2.</span></div>
       <div class="note glass"><b>Keep install.bat ASCII</b><span>cmd can cut a UTF-8 line that crosses its 512-byte read block. Put localized text in a UTF-8 file and print it with &quot;type&quot;.</span></div>
       <div class="note glass"><b>Glass needs a modern Windows</b><span>Acrylic works on current Windows 10 / 11; if unavailable the window falls back to a clean white card.</span></div>
+      <div class="note glass"><b>First run of an app is slower</b><span>--app packages unpack once through the 7-Zip self-extractor (about 2 s for a tiny payload). Later runs skip that entirely.</span></div>
     </div>
   </section>
 

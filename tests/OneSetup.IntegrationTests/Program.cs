@@ -111,6 +111,7 @@ static class Program
         await AssertLevelAndProgressAsync(packerPath, sevenZipPath, testRoot, runnerDirectory);
         await AssertUiPackagingAsync(packerPath, sevenZipPath, sourceDirectory, runnerDirectory);
         await AssertFailureExitCodeAsync(packerPath, runnerDirectory, testRoot);
+        await AssertAppModeAsync(packerPath, runnerDirectory, testRoot);
         await AssertLaunchedProgramSurvivesAsync(packerPath, runnerDirectory, testRoot);
 
         ProcessResult sfxResult = await RunProcessAsync(
@@ -256,6 +257,51 @@ static class Program
         for (int attempt = 0; attempt < 120 && !File.Exists(marker); attempt++)
             await Task.Delay(100);
         Ensure(File.Exists(marker), "The program started by install.bat did not survive the installer.");
+    }
+
+    // --app: first run extracts into a per-user cache keyed by the payload hash, later runs start the program directly.
+    static async Task AssertAppModeAsync(string packerPath, string runnerDirectory, string testRoot)
+    {
+        string source = Path.Combine(testRoot, "app-source");
+        Directory.CreateDirectory(source);
+        await File.WriteAllTextAsync(Path.Combine(source, "hello.bat"),
+            "@echo off\r\necho cwd=%CD%\r\necho args=%*\r\necho run>> \"%~dp0runs.txt\"\r\nexit /b %HELLO_EXIT%\r\n");
+        await File.WriteAllTextAsync(Path.Combine(source, "data.txt"), "payload");
+        string setup = Path.Combine(runnerDirectory, "app_setup.exe");
+        ProcessResult pack = await RunProcessAsync(packerPath, [source, "-o", setup, "-l", "1", "--app", "hello.bat"], runnerDirectory, timeout: TestTimeout);
+        Ensure(pack.ExitCode == 0, $"Packing with --app failed. {pack.StandardError}");
+
+        string cache = Path.Combine(testRoot, "app-cache"), work = Path.Combine(testRoot, "app-work");
+        Directory.CreateDirectory(work);
+        Dictionary<string, string?> environment = new() { ["ONESETUP_CACHE"] = cache, ["HELLO_EXIT"] = "0" };
+
+        ProcessResult cold = await RunProcessAsync(setup, ["one", "two words"], work, environment, TestTimeout);
+        Ensure(cold.ExitCode == 0, $"Cold run failed ({cold.ExitCode}). {cold.StandardError}");
+        Ensure(cold.StandardOutput.Contains($"cwd={work}", StringComparison.OrdinalIgnoreCase), $"The program did not run in the caller's directory. {cold.StandardOutput}");
+        Ensure(cold.StandardOutput.Contains("args=one \"two words\"", StringComparison.Ordinal), $"Arguments were not passed through. {cold.StandardOutput}");
+        string[] entries = Directory.GetDirectories(cache);
+        Ensure(entries.Length == 1 && File.Exists(Path.Combine(entries[0], ".ready")), "The first run did not leave exactly one finished cache entry.");
+        DateTime readyStamp = File.GetLastWriteTimeUtc(Path.Combine(entries[0], ".ready"));
+
+        ProcessResult warm = await RunProcessAsync(setup, ["three"], work, environment, TestTimeout);
+        Ensure(warm.ExitCode == 0 && warm.StandardOutput.Contains("args=three", StringComparison.Ordinal), $"Warm run failed ({warm.ExitCode}). {warm.StandardError}");
+        Ensure(Directory.GetDirectories(cache).Length == 1 && File.GetLastWriteTimeUtc(Path.Combine(entries[0], ".ready")) == readyStamp, "The warm run extracted again.");
+        Ensure(File.ReadAllLines(Path.Combine(entries[0], "runs.txt")).Length == 2, "The program did not run twice from the same cache entry.");
+
+        environment["HELLO_EXIT"] = "7";
+        ProcessResult failing = await RunProcessAsync(setup, [], work, environment, TestTimeout);
+        Ensure(failing.ExitCode == 7, $"The program's exit code was not returned (got {failing.ExitCode}).");
+
+        // Several first runs at once: all succeed, exactly one cache entry, no staging folders left behind.
+        string raceCache = Path.Combine(testRoot, "app-race-cache");
+        Dictionary<string, string?> raceEnvironment = new() { ["ONESETUP_CACHE"] = raceCache, ["HELLO_EXIT"] = "0" };
+        ProcessResult[] race = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => RunProcessAsync(setup, [], work, raceEnvironment, TestTimeout)));
+        Ensure(race.All(result => result.ExitCode == 0), $"A concurrent first run failed: {string.Join(',', race.Select(result => result.ExitCode))}");
+        string[] raceEntries = Directory.GetDirectories(raceCache);
+        Ensure(raceEntries.Length == 1 && !raceEntries[0].Contains(".tmp-", StringComparison.Ordinal), $"Concurrent first runs left {raceEntries.Length} entries.");
+
+        ProcessResult missing = await RunProcessAsync(packerPath, [source, "-o", Path.Combine(runnerDirectory, "never_app.exe"), "--app", "absent.exe"], runnerDirectory, timeout: TestTimeout);
+        Ensure(missing.ExitCode != 0 && !File.Exists(Path.Combine(runnerDirectory, "never_app.exe")), "--app accepted a program that is not in the directory.");
     }
 
     // install.bat's exit code must reach the caller of setup.exe (the 7zSD module alone always returns 0).

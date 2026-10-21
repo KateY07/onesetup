@@ -8,7 +8,7 @@ set "EXE=%~1"
 if "%EXE%"=="" set "EXE=%~dp0..\publish\onesetup-ui.exe"
 for %%F in ("%EXE%") do if not exist "%%~dpF" mkdir "%%~dpF"
 pushd "%~dp0"
-cl /nologo /std:c++17 /O2 /MT /EHsc /W3 /utf-8 /DUNICODE /D_UNICODE main.cpp /Fe:"%EXE%" /Fo:"%TEMP%\onesetup-ui.obj" /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:app.manifest
+cl /nologo /std:c++17 /O2 /MT /EHsc /W3 /utf-8 /DUNICODE /D_UNICODE main.cpp /Fe:"%EXE%" /Fo:"%TEMP%\onesetup-ui.obj" /link /SUBSYSTEM:WINDOWS delayimp.lib /DELAYLOAD:d3d11.dll /DELAYLOAD:dxgi.dll /DELAYLOAD:d2d1.dll /DELAYLOAD:dwrite.dll /DELAYLOAD:dcomp.dll /DELAYLOAD:dwmapi.dll /DELAYLOAD:user32.dll /DELAYLOAD:gdi32.dll /DELAYLOAD:shell32.dll /OPT:REF /OPT:ICF /MANIFEST:EMBED /MANIFESTINPUT:app.manifest
 set "RC=%ERRORLEVEL%"
 popd
 exit /b %RC%

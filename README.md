@@ -43,6 +43,22 @@ dotnet publish -c Release -p:OneSetupUiExe=D:\path\to\onesetup-ui.exe
 
 生成的安装包会返回 `install.bat` 的退出码（7zSD 模块本身恒返回 0，所以在它前面加了一个很小的外壳来收集真实退出码）。`--ui` 时在窗口里点“取消”返回 2；解压或启动失败返回非 0。`onesetup` 自身：0 成功，1 出错，2 缺少参数。
 
+## 单文件应用（`--app`，可选）
+
+`--app <程序>` 生成的不是安装器，而是“单文件直接启动”的应用：首次运行时解压到 `%LOCALAPPDATA%\OneSetup\apps\<内容哈希>`，之后每次运行只检查一个标记文件，然后直接从缓存启动 `<程序>`。
+
+```powershell
+.\onesetup.exe tool --app tool.exe -l 1 -o tool_portable.exe   # 首次解压更快：-l 1 或 0
+.\tool_portable.exe --any args                                 # 参数、工作目录、控制台、退出码、Ctrl+C 都原样传递
+```
+
+- **第二次启动的额外耗时**约等于多启动一个进程（本机实测约 10 ms，对比直接运行同一个程序）；路径上没有解压、没有哈希计算、没有界面，只有一次文件状态检查和一次 `CreateProcess`。
+- 控制台程序和脚本得到控制台版启动器（能正常读写标准输入输出），图形界面程序得到无控制台版，不会闪黑窗。
+- 缓存目录以内容哈希命名：程序更新（内容变化）会生成新目录，旧目录不会自动删除；环境变量 `ONESETUP_CACHE` 可改缓存位置。
+- **首次运行较慢**：首次解压目前走 7-Zip 自解压模块，很小的包也要约 2 秒（多为固定开销）；大包可用 `-l 1` 或 `-l 0` 加快。这是已知的取舍。
+- 多个实例同时首次运行是安全的（先解压到临时目录，再原子改名，只留下一份）。
+- `--app` 不运行 `install.bat`，也不能与 `--ui` 同时使用。缓存位于用户可写的位置，所以它不提供防篡改保护。
+
 ## 安装 OneSetup 本身
 
 OneSetup 用自己打包了自己：从 [Releases](https://github.com/KateY07/onesetup/releases) 下载 `onesetup-setup.exe`，运行后会把 `onesetup.exe` 复制到 `%LOCALAPPDATA%\OneSetup` 并加入当前用户的 PATH（不需要管理员权限），然后提供一段无害的幽默演示（可以拒绝；设置环境变量 `ONESETUP_UNATTENDED=1` 可跳过提问和演示）。
