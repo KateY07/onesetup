@@ -25,7 +25,7 @@ On success the badge turns green with a drawn check, a ripple and confetti; fail
 `install.bat` runs with `ONESETUP_SHELL=ui` (or `headless`) and with stdin connected to the shell, so do not use `pause`
 or `choice` unguarded: `if not defined ONESETUP_SHELL pause`.
 
-Programs the script starts (`start "" "%TARGET%pp.exe"`) keep running after the installer closes; the shell does not
+Programs the script starts (`start "" "%TARGET%\app.exe"`) keep running after the installer closes; the shell does not
 wait for them or stop them. Only Cancel stops the script and everything it started so far.
 
 The generated installer always exits 0 (the 7zSD module does not pass the script's exit code on); the shell itself
